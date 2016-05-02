@@ -54,7 +54,7 @@ else(no_yasm)
     set(CMAKE_REQUIRED_QUIET ${save_quiet})
     if(not_arch_x32)
       message(STATUS " we are not x32")
-      set(HAVE_GOOD_YASM_ELF64 1)
+      set(HAVE_GOOD_YASM_ELF64 1 PARENT_SCOPE)
       add_definitions("-DHAVE_GOOD_YASM_ELF64")
       execute_process(COMMAND yasm -f elf64 -i
         ${CMAKE_SOURCE_DIR}/src/erasure-code/isa/isa-l/include/
@@ -63,7 +63,7 @@ else(no_yasm)
         RESULT_VARIABLE rc
         OUTPUT_QUIET)
       if(NOT rc)
-        set(HAVE_BETTER_YASM_ELF64 1)
+        set(HAVE_BETTER_YASM_ELF64 1 PARENT_SCOPE)
         add_definitions("-DHAVE_BETTER_YASM_ELF64")
         message(STATUS " yasm can also build the isa-l stuff")
       endif(NOT rc)
@@ -93,6 +93,17 @@ set(EXTRALIBS uuid rt dl ${ATOMIC_OPS_LIBRARIES})
 if(${WITH_PROFILER})
   list(APPEND EXTRALIBS profiler)
 endif(${WITH_PROFILER})
+
+if(${ENABLE_COVERAGE})
+  find_program(HAVE_GCOV gcov)
+  find_program(HAVE_LCOV lcov)
+  if(NOT HAVE_GCOV)
+    message(FATAL_ERROR "Coverage Enabled but gcov Not Found")
+  endif(NOT HAVE_GCOV)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-arcs -ftest-coverage -O0")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-arcs -ftest-coverage")
+  list(APPEND EXTRALIBS gcov)
+endif(${ENABLE_COVERAGE})
 
 if(USE_NSS)
   if(NSS_FOUND)
@@ -646,11 +657,11 @@ add_dependencies(ceph-mon erasure_code_plugins)
 install(TARGETS ceph-mon DESTINATION bin)
 
 # OSD
-if(${HAVE_XFS})
+if(${HAVE_LIBXFS})
   set(libos_xfs_srcs
     os/filestore/XfsFileStoreBackend.cc
     os/fs/XFS.cc)
-endif(${HAVE_XFS})
+endif(${HAVE_LIBXFS})
 set(libos_srcs
   os/ObjectStore.cc
   os/Transaction.cc
@@ -1215,10 +1226,6 @@ if(${WITH_RADOSGW})
   target_link_libraries(rgw_a librados cls_rgw_client cls_refcount_client
     cls_log_client cls_statelog_client cls_timeindex_client cls_version_client
     cls_replica_log_client cls_user_client curl global expat)
-
-  if(HAVE_BOOST_ASIO_COROUTINE)
-    target_compile_definitions(rgw_a PUBLIC "HAVE_BOOST_ASIO_COROUTINE")
-  endif()
 
   set(radosgw_srcs
     rgw/rgw_fcgi_process.cc

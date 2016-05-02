@@ -30,6 +30,7 @@ try_compile(ARM_NEON2 ${CMAKE_BINARY_DIR} ${sse_srcs}
 file(REMOVE ${sse_srcs})
 
 if(ARM_NEON OR ARM_NEON2)
+  set(HAVE_NEON 1)
   if(ARM_NEON)
     set(ARM_NEON_FLAGS "-mfpu=neon")
   else(ARM_NEON)
@@ -40,8 +41,10 @@ else(ARM_NEON OR ARM_NEON2)
 endif(ARM_NEON OR ARM_NEON2)
 
 if(INTEL_SSE)
+  set(HAVE_SSE 1)
   set(SSE3_FLAGS "-msse")
   if (INTEL_SSE2)
+    set(HAVE_SSE2 1)
     set(SSE3_FLAGS "${SSE3_FLAGS} -msse2")
   endif (INTEL_SSE2)
   if (INTEL_SSE3)
