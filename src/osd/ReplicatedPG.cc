@@ -10941,9 +10941,6 @@ uint64_t ReplicatedPG::recover_backfill(
   }
   backfill_info.trim_to(last_backfill_started);
 
-  hobject_t backfill_pos = MIN_HOBJ(backfill_info.begin,
-				    earliest_peer_backfill(),
-				    get_sort_bitwise());
   while (ops < max) {
     if (cmp(backfill_info.begin, earliest_peer_backfill(),
 	    get_sort_bitwise()) <= 0 &&
@@ -10954,8 +10951,6 @@ uint64_t ReplicatedPG::recover_backfill(
       update_range(&backfill_info, handle);
       backfill_info.trim();
     }
-    backfill_pos = MIN_HOBJ(backfill_info.begin, earliest_peer_backfill(),
-			    get_sort_bitwise());
 
     dout(20) << "   my backfill interval " << backfill_info << dendl;
 
@@ -11114,7 +11109,8 @@ uint64_t ReplicatedPG::recover_backfill(
       }
     }
   }
-  backfill_pos = MIN_HOBJ(backfill_info.begin, earliest_peer_backfill(),
+
+  hobject_t backfill_pos = MIN_HOBJ(backfill_info.begin, earliest_peer_backfill(),
 			  get_sort_bitwise());
 
   for (set<hobject_t, hobject_t::BitwiseComparator>::iterator i = add_to_stat.begin();
