@@ -2500,12 +2500,6 @@ public:
     ThreadPool::TPHandle &handle
   ) = 0;
 
-  virtual void do_op(OpRequestRef& op) = 0;
-  virtual void do_scan(
-    OpRequestRef op,
-    ThreadPool::TPHandle &handle
-  ) = 0;
-  virtual void do_backfill(OpRequestRef op) = 0;
   virtual void snap_trimmer(epoch_t epoch_queued) = 0;
 
   virtual int do_command(
