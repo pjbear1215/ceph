@@ -1912,7 +1912,7 @@ void PG::take_op_map_waiters()
     if (op_must_wait_for_map(get_osdmap_with_maplock()->get_epoch(), *i)) {
       break;
     } else {
-      osd->op_wq.queue(make_pair(PGRef(this), *i));
+      osd->queue_op(this, *i);
       waiting_for_map.erase(i++);
     }
   }
@@ -1933,7 +1933,7 @@ void PG::queue_op(OpRequestRef& op)
     return;
   }
   op->mark_queued_for_pg();
-  osd->op_wq.queue(make_pair(PGRef(this), op));
+  osd->queue_op(this, op);
   {
     // after queue() to include any locking costs
 #ifdef WITH_LTTNG
@@ -3276,7 +3276,7 @@ void PG::requeue_object_waiters(map<hobject_t, list<OpRequestRef>, hobject_t::Bi
 
 void PG::requeue_op(OpRequestRef op)
 {
-  osd->op_wq.queue_front(make_pair(PGRef(this), op));
+  osd->queue_op_front(this, op);
 }
 
 void PG::requeue_ops(list<OpRequestRef> &ls)
@@ -3285,7 +3285,7 @@ void PG::requeue_ops(list<OpRequestRef> &ls)
   for (list<OpRequestRef>::reverse_iterator i = ls.rbegin();
        i != ls.rend();
        ++i) {
-    osd->op_wq.queue_front(make_pair(PGRef(this), *i));
+    osd->queue_op_front(this, *i);
   }
   ls.clear();
 }
