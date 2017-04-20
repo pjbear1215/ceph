@@ -3373,7 +3373,7 @@ namespace {
     RECOVERY_PRIORITY, RECOVERY_OP_PRIORITY, SCRUB_PRIORITY,
     COMPRESSION_MODE, COMPRESSION_ALGORITHM, COMPRESSION_REQUIRED_RATIO,
     COMPRESSION_MAX_BLOB_SIZE, COMPRESSION_MIN_BLOB_SIZE,
-    CSUM_TYPE, CSUM_MAX_BLOCK, CSUM_MIN_BLOCK };
+    CSUM_TYPE, CSUM_MAX_BLOCK, CSUM_MIN_BLOCK, EXTENSIBLE_MODE };
 
   std::set<osd_pool_get_choices>
     subtract_second_from_first(const std::set<osd_pool_get_choices>& first,
@@ -3880,6 +3880,7 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
       {"csum_type", CSUM_TYPE},
       {"csum_max_block", CSUM_MAX_BLOCK},
       {"csum_min_block", CSUM_MIN_BLOCK},
+      {"extensible_mode", EXTENSIBLE_MODE},
     };
 
     typedef std::set<osd_pool_get_choices> choices_set_t;
@@ -4098,6 +4099,9 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
               p->opts.dump(i->first, f.get());
             }
             break;
+	  case EXTENSIBLE_MODE:
+	    f->dump_int("extensible_mode", p->extensible_mode);
+	    break;
 	}
 	f->close_section();
 	f->flush(rdata);
@@ -4258,6 +4262,9 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
                 }
 	      }
 	    }
+	    break;
+	  case EXTENSIBLE_MODE:
+	    ss << "extensible mode: " << (int) p->extensible_mode << "\n";
 	    break;
 	}
 	rdata.append(ss.str());
@@ -5792,6 +5799,8 @@ int OSDMonitor::prepare_command_pool_set(map<string,cmd_vartype> &cmdmap,
     default:
       assert(!"unknown type");
     }
+  } else if (var == "extensible_mode") {
+    p.extensible_mode = pg_pool_t::extensible_tier_mode_t::EXTENSIBLEMODE_REDIRECT;
   } else {
     ss << "unrecognized variable '" << var << "'";
     return -EINVAL;
@@ -7854,6 +7863,62 @@ done:
     np->clear_write_tier();
     np->set_last_force_op_resend(pending_inc.epoch);
     ss << "there is now (or already was) no overlay for '" << poolstr << "'";
+    wait_for_finished_proposal(op, new Monitor::C_Command(mon, op, 0, ss.str(),
+					      get_last_committed() + 1));
+    return true;
+  } else if (prefix == "osd tier extensible-mode") {
+    err = check_cluster_features(CEPH_FEATURE_OSD_CACHEPOOL, ss);
+    if (err == -EAGAIN)
+      goto wait;
+    if (err)
+      goto reply;
+    string poolstr;
+    cmd_getval(g_ceph_context, cmdmap, "pool", poolstr);
+    int64_t pool_id = osdmap.lookup_pg_pool_name(poolstr);
+    if (pool_id < 0) {
+      ss << "unrecognized pool '" << poolstr << "'";
+      err = -ENOENT;
+      goto reply;
+    }
+    const pg_pool_t *p = osdmap.get_pg_pool(pool_id);
+    assert(p);
+    if (!p->is_tier()) {
+      ss << "pool '" << poolstr << "' is not a tier";
+      err = -EINVAL;
+      goto reply;
+    }
+    string modestr;
+    cmd_getval(g_ceph_context, cmdmap, "mode", modestr);
+    pg_pool_t::extensible_tier_mode_t mode = pg_pool_t::get_extensible_mode_from_str(modestr); //TODO
+    if (mode < 0) {
+      ss << "'" << modestr << "' is not a valid extensible mode";
+      err = -EINVAL;
+      goto reply;
+    }
+
+    if (p->extensible_mode == mode &&
+	(pending_inc.new_pools.count(pool_id) == 0 ||
+	 pending_inc.new_pools[pool_id].extensible_mode == p->extensible_mode)) {
+      ss << "set extend-mode for pool '" << poolstr << "'"
+         << " to " << pg_pool_t::get_extensible_mode_name(mode); //TODO
+      err = 0;
+      goto reply;
+    }
+
+    pg_pool_t *np = pending_inc.get_new_pool(pool_id, p);
+    np->extensible_mode = mode;
+    np->target_max_objects = 0;
+    np->cache_mode = pg_pool_t::CACHEMODE_NONE;
+    np->flags |= pg_pool_t::FLAG_INCOMPLETE_CLONES;
+    ss << "set extend-mode for pool '" << poolstr
+	<< "' to " << pg_pool_t::get_extensible_mode_name(mode);
+    if (mode == pg_pool_t::EXTENSIBLEMODE_NONE) {
+      const pg_pool_t *base_pool = osdmap.get_pg_pool(np->tier_of);
+      assert(base_pool);
+      if (base_pool->read_tier == pool_id ||
+	  base_pool->write_tier == pool_id)
+	ss <<" (WARNING: pool is still configured as read or write tier)";
+    }
     wait_for_finished_proposal(op, new Monitor::C_Command(mon, op, 0, ss.str(),
 					      get_last_committed() + 1));
     return true;

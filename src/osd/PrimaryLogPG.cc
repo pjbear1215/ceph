@@ -2064,7 +2064,6 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     if (agent_choose_mode(false, op))
       return;
   }
-
   if (maybe_handle_cache(op,
 			 write_ordered,
 			 obc,
@@ -2207,6 +2206,105 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
   } else if (op->may_write() || op->may_cache()) {
     osd->logger->tinc(l_osd_op_w_prepare_lat, prepare_latency);
   }
+}
+
+PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_extensible_tier_detail(
+  OpRequestRef op,
+  bool write_ordered,
+  ObjectContextRef obc,
+  int r, hobject_t missing_oid,
+  bool must_promote,
+  bool in_hit_set,
+  ObjectContextRef *promote_obc)
+{
+  if (obc)
+    dout(10) << __func__ << " " << obc->obs.oi << " "
+	     << (obc->obs.exists ? "exists" : "DNE")
+	     << " missing_oid " << missing_oid
+	     << dendl;
+  else
+    dout(10) << __func__ << " (no obc)"
+	     << " missing_oid " << missing_oid
+	     << dendl;
+  // if it is write-ordered and blocked, stop now
+  if (obc.get() && obc->is_blocked() && write_ordered) {
+    // we're already doing something with this object
+    dout(20) << __func__ << " blocked on " << obc->obs.oi.soid << dendl;
+    return cache_result_t::NOOP;
+  }
+
+  if (r == -ENOENT && missing_oid == hobject_t()) {
+    // we know this object is logically absent (e.g., an undefined clone)
+    return cache_result_t::NOOP;
+  }
+
+  // New object ? --> should be stored in the base pool
+  if (!obc->obs.exists) {
+    return cache_result_t::NOOP;
+  } 
+
+  assert(obc->obs.oi.is_extend_tier());
+#if 0
+  if (!obc->obs.oi.is_extend_tier()) {
+    return cache_result_t::NOOP;
+  }
+#endif
+
+  // Already in the base pool
+  if (obc->obs.exists && (obc->obs.oi.size > 0)) {
+    return cache_result_t::NOOP;
+  }
+
+  if (missing_oid == hobject_t() && obc.get()) {
+    missing_oid = obc->obs.oi.soid;
+  }
+  const MOSDOp *m = static_cast<const MOSDOp*>(op->get_req());
+  const object_locator_t oloc = m->get_object_locator();
+
+  OpRequestRef promote_op;
+  // The metadata exists in the base pool, but the data doesn't exist in the base pool
+  switch (pool.info.extensible_mode) {
+  case pg_pool_t::EXTENSIBLEMODE_REDIRECT:
+    if (agent_state &&
+	agent_state->evict_mode == TierAgentState::EVICT_MODE_FULL) {
+      if (!op->may_write() && !op->may_cache() &&
+	  !write_ordered) {
+	dout(20) << __func__ << " extended pool full, proxying read" << dendl;
+	do_proxy_read(op);
+	return cache_result_t::HANDLED_PROXY;
+      }
+      dout(20) << __func__ << " base pool full, waiting" << dendl;
+      block_write_on_full_cache(missing_oid, op);
+      return cache_result_t::BLOCKED_FULL;
+    }
+
+    if (op->may_write() || op->may_cache()) {
+      promote_object(obc, missing_oid, oloc, op, promote_obc);
+      return cache_result_t::BLOCKED_PROMOTE;
+    } else {
+      do_proxy_read(op);
+
+      // Avoid duplicate promotion
+      if (obc.get() && obc->is_blocked()) {
+	if (promote_obc)
+	  *promote_obc = obc;
+        return cache_result_t::BLOCKED_PROMOTE;
+      }
+
+      if (!op->need_skip_promote()) {
+	(void)maybe_promote(obc, missing_oid, oloc, in_hit_set,
+			    pool.info.min_read_recency_for_promote,
+			    promote_op, promote_obc);
+      }
+
+      return cache_result_t::HANDLED_PROXY;
+    }
+  case pg_pool_t::EXTENSIBLEMODE_CHUNKED:
+  default:
+    assert(0 == "unrecognized extend_mode");
+  }
+
+  return cache_result_t::NOOP;
 }
 
 void PrimaryLogPG::record_write_error(OpRequestRef op, const hobject_t &soid,
@@ -4129,6 +4227,23 @@ static string list_entries(const T& m) {
   return s;
 }
 
+void PrimaryLogPG::maybe_object_in_extensible_tier(ObjectState& obs)
+{
+  if (pool.info.extensible_mode != pg_pool_t::EXTENSIBLEMODE_NONE) {
+    if (!pool.info.has_tiers() && pool.info.is_tier()) {
+      obs.oi.set_flag(object_info_t::FLAG_EXTENSIBLE_TIER);
+    }
+    switch (pool.info.extensible_mode) {
+    case pg_pool_t::EXTENSIBLEMODE_REDIRECT:
+      obs.oi.obj_manifest.type = object_manifest_t::TYPE_REDIRECT;
+      obs.oi.obj_manifest.redirect_target = ghobject_t(obs.oi.soid);
+      break;
+    default:
+      assert(0 == "unrecognized extensible_mode");
+    }
+  }
+}
+
 void PrimaryLogPG::maybe_create_new_object(
   OpContext *ctx,
   bool ignore_transaction)
@@ -4138,6 +4253,7 @@ void PrimaryLogPG::maybe_create_new_object(
     ctx->delta_stats.num_objects++;
     obs.exists = true;
     obs.oi.new_object();
+    maybe_object_in_extensible_tier(obs);
     if (!ignore_transaction)
       ctx->op_t->create(obs.oi.soid);
   } else if (obs.oi.is_whiteout()) {
@@ -4578,7 +4694,8 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  result = -EINVAL;
 	  break;
 	}
-	if (pool.info.cache_mode == pg_pool_t::CACHEMODE_NONE) {
+	if (pool.info.cache_mode == pg_pool_t::CACHEMODE_NONE &&
+	    pool.info.extensible_mode == pg_pool_t::EXTENSIBLEMODE_NONE) {
 	  result = -EINVAL;
 	  break;
 	}
@@ -4610,7 +4727,8 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  result = -EINVAL;
 	  break;
 	}
-	if (pool.info.cache_mode == pg_pool_t::CACHEMODE_NONE) {
+	if (pool.info.cache_mode == pg_pool_t::CACHEMODE_NONE &&
+	    pool.info.extensible_mode == pg_pool_t::EXTENSIBLEMODE_NONE) {
 	  result = -EINVAL;
 	  break;
 	}
@@ -4646,7 +4764,8 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       ++ctx->num_write;
       {
 	tracepoint(osd, do_osd_op_pre_cache_evict, soid.oid.name.c_str(), soid.snap.val);
-	if (pool.info.cache_mode == pg_pool_t::CACHEMODE_NONE) {
+	if (pool.info.cache_mode == pg_pool_t::CACHEMODE_NONE &&
+	    pool.info.extensible_mode == pg_pool_t::EXTENSIBLEMODE_NONE) {
 	  result = -EINVAL;
 	  break;
 	}
@@ -4672,7 +4791,11 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  if (result < 0)
 	    break;
 	}
-	result = _delete_oid(ctx, true);
+	if (oi.is_extend_tier()) {
+	  result = _truncate_oid(ctx);
+	} else {
+	  result = _delete_oid(ctx, true);
+	}
 	if (result >= 0) {
 	  // mark that this is a cache eviction to avoid triggering normal
 	  // make_writeable() clone or snapdir object creation in finish_ctx()
@@ -6025,6 +6148,29 @@ int PrimaryLogPG::_verify_no_head_clones(const hobject_t& soid,
   return 0;
 }
 
+inline int PrimaryLogPG::_truncate_oid(OpContext *ctx)
+{
+  ObjectState& obs = ctx->new_obs;
+  object_info_t& oi = obs.oi;
+  const hobject_t& soid = oi.soid;
+  PGTransaction* t = ctx->op_t.get();
+
+  if (!obs.exists || obs.oi.is_whiteout())
+    return -ENOENT;
+
+  t->truncate(soid, 0);
+
+  if (oi.size > 0) {
+    interval_set<uint64_t> ch;
+    ch.insert(0, oi.size);
+    ctx->modified_ranges.union_of(ch);
+  }
+
+  oi.size = 0;
+
+  return 0;
+}
+
 inline int PrimaryLogPG::_delete_oid(OpContext *ctx, bool no_whiteout)
 {
   SnapSet& snapset = ctx->new_snapset;
@@ -6118,16 +6264,30 @@ int PrimaryLogPG::_rollback_to(OpContext *ctx, ceph_osd_op& op)
   }
   {
     ObjectContextRef promote_obc;
-    switch (
-      maybe_handle_cache_detail(
-	ctx->op,
-	true,
-	rollback_to,
-	ret,
-	missing_oid,
-	true,
-	false,
-	&promote_obc)) {
+    cache_result_t tier_mode_result;
+    if (pool.info.extensible_mode != pg_pool_t::EXTENSIBLEMODE_NONE) {
+      tier_mode_result = maybe_handle_extensible_tier_detail(
+			  ctx->op,
+			  true,
+			  rollback_to,
+			  ret,
+			  missing_oid,
+			  true,
+			  false,
+			  &promote_obc);
+    } else {
+      tier_mode_result = maybe_handle_cache_detail(
+			  ctx->op,
+			  true,
+			  rollback_to,
+			  ret,
+			  missing_oid,
+			  true,
+			  false,
+			  &promote_obc);
+    }
+
+    switch (tier_mode_result) {
     case cache_result_t::NOOP:
       break;
     case cache_result_t::BLOCKED_PROMOTE:
@@ -12076,7 +12236,12 @@ bool PrimaryLogPG::agent_maybe_evict(ObjectContextRef& obc, bool after_flush)
 
   ctx->at_version = get_next_version();
   assert(ctx->new_obs.exists);
-  int r = _delete_oid(ctx.get(), true);
+  int r = -1;
+  if (obc->obs.oi.is_extend_tier()) {
+    r = _truncate_oid(ctx.get());
+  } else {
+    r = _delete_oid(ctx.get(), true);
+  }
   if (obc->obs.oi.is_omap())
     ctx->delta_stats.num_objects_omap--;
   ctx->delta_stats.num_evict++;
@@ -12084,7 +12249,9 @@ bool PrimaryLogPG::agent_maybe_evict(ObjectContextRef& obc, bool after_flush)
   if (obc->obs.oi.is_dirty())
     --ctx->delta_stats.num_objects_dirty;
   assert(r == 0);
-  finish_ctx(ctx.get(), pg_log_entry_t::DELETE, false);
+  if (!obc->obs.oi.is_extend_tier()) {
+    finish_ctx(ctx.get(), pg_log_entry_t::DELETE, false);
+  }
   simple_opc_submit(std::move(ctx));
   osd->logger->inc(l_osd_tier_evict);
   osd->logger->inc(l_osd_agent_evict);

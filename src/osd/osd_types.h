@@ -1240,6 +1240,41 @@ struct pg_pool_t {
     }
   }
 
+  typedef enum {
+    EXTENSIBLEMODE_NONE = 0,                  ///< no external tier
+    EXTENSIBLEMODE_REDIRECT = 1,             ///< a simple redirect
+    EXTENSIBLEMODE_CHUNKED = 2,               ///< an object is divided by chunk size and it is forwarded to differnt pool 
+    EXTENSIBLEMODE_DEDUP = 3,               ///< chunk + dedup
+    EXTENSIBLEMODE_EXTERNAL = 4,              ///< external backup system
+  } extensible_tier_mode_t;
+
+  static const char *get_extensible_mode_name(extensible_tier_mode_t m) {
+    switch (m) {
+    case EXTENSIBLEMODE_NONE: return "none";
+    case EXTENSIBLEMODE_REDIRECT: return "redirect";
+    case EXTENSIBLEMODE_CHUNKED: return "chunked";
+    case EXTENSIBLEMODE_DEDUP: return "dedup";
+    case EXTENSIBLEMODE_EXTERNAL: return "external";
+    default: return "unknown";
+    }
+  }
+  static extensible_tier_mode_t get_extensible_mode_from_str(const string& s) {
+    if (s == "none")
+      return EXTENSIBLEMODE_NONE;
+    if (s == "redirect")
+      return EXTENSIBLEMODE_REDIRECT;
+    if (s == "chunked")
+      return EXTENSIBLEMODE_CHUNKED;
+    if (s == "dedup")
+      return EXTENSIBLEMODE_DEDUP;
+    if (s == "external")
+      return EXTENSIBLEMODE_EXTERNAL;
+    return (extensible_tier_mode_t)-1;
+  }
+  const char *get_extensible_mode_name() const {
+    return get_extensible_mode_name(extensible_mode);
+  }
+
   uint64_t flags;           ///< FLAG_*
   __u8 type;                ///< TYPE_*
   __u8 size, min_size;      ///< number of osds in each pg
@@ -1346,6 +1381,7 @@ public:
 
   pool_opts_t opts; ///< options
 
+  extensible_tier_mode_t extensible_mode;
 private:
   vector<uint32_t> grade_table;
 
@@ -1395,7 +1431,8 @@ public:
       stripe_width(0),
       expected_num_objects(0),
       fast_read(false),
-      opts()
+      opts(),
+      extensible_mode(EXTENSIBLEMODE_NONE)
   { }
 
   void dump(Formatter *f) const;
@@ -3964,6 +4001,14 @@ static inline ostream& operator<<(ostream& out, const notify_info_t& n) {
 	     << " " << n.timeout << "s)";
 }
 
+struct object_manifest_t {
+  enum {
+    TYPE_REDIRECT = 1,  // start with this
+    TYPE_CHUNKED = 2,   // do this later
+  };
+  uint8_t type;  // redirect, chunked, ...
+  ghobject_t redirect_target;
+};
 
 struct object_info_t {
   hobject_t soid;
@@ -3985,6 +4030,7 @@ struct object_info_t {
     FLAG_DATA_DIGEST = 1 << 4,  // has data crc
     FLAG_OMAP_DIGEST = 1 << 5,  // has omap crc
     FLAG_CACHE_PIN = 1 << 6,    // pin the object in cache tier
+    FLAG_EXTENSIBLE_TIER = 1 << 7,	// pin the object metadata in extend tier
     // ...
     FLAG_USES_TMAP = 1<<8,  // deprecated; no longer used.
   } flag_t;
@@ -4031,6 +4077,8 @@ struct object_info_t {
   uint64_t expected_object_size, expected_write_size;
   uint32_t alloc_hint_flags;
 
+  struct object_manifest_t obj_manifest;
+
   void copy_user_bits(const object_info_t& other);
 
   static ps_t legacy_object_locator_to_ps(const object_t &oid, 
@@ -4065,6 +4113,9 @@ struct object_info_t {
   }
   bool is_cache_pinned() const {
     return test_flag(FLAG_CACHE_PIN);
+  }
+  bool is_extend_tier() const {
+    return test_flag(FLAG_EXTENSIBLE_TIER);
   }
 
   void set_data_digest(__u32 d) {

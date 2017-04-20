@@ -1115,6 +1115,13 @@ protected:
 					   bool must_promote,
 					   bool in_hit_set,
 					   ObjectContextRef *promote_obc);
+  cache_result_t maybe_handle_extensible_tier_detail(OpRequestRef op,
+					   bool write_ordered,
+					   ObjectContextRef obc, int r,
+					   hobject_t missing_oid,
+					   bool must_promote,
+					   bool in_hit_set,
+					   ObjectContextRef *promote_obc);
   /**
    * This helper function is called from do_op if the ObjectContext lookup fails.
    * @returns true if the caching code is handling the Op, false otherwise.
@@ -1125,6 +1132,18 @@ protected:
 			  const hobject_t& missing_oid,
 			  bool must_promote,
 			  bool in_hit_set = false) {
+    
+    if (pool.info.extensible_mode != pg_pool_t::EXTENSIBLEMODE_NONE) {
+      return cache_result_t::NOOP != maybe_handle_extensible_tier_detail(
+	op,
+	write_ordered,
+	obc,
+	r,
+	missing_oid,
+	must_promote,
+	in_hit_set,
+	nullptr);
+    } 
     return cache_result_t::NOOP != maybe_handle_cache_detail(
       op,
       write_ordered,
@@ -1691,6 +1710,8 @@ private:
   // return true if we're creating a local object, false for a
   // whiteout or no change.
   void maybe_create_new_object(OpContext *ctx, bool ignore_transaction=false);
+  void maybe_object_in_extensible_tier(ObjectState& obs);
+  int _truncate_oid(OpContext *ctx);
   int _delete_oid(OpContext *ctx, bool no_whiteout);
   int _rollback_to(OpContext *ctx, ceph_osd_op& op);
 public:

@@ -1492,7 +1492,7 @@ void pg_pool_t::encode(bufferlist& bl, uint64_t features) const
     return;
   }
 
-  uint8_t v = 25;
+  uint8_t v = 26;
   if (!(features & CEPH_FEATURE_NEW_OSDOP_ENCODING)) {
     // this was the first post-hammer thing we added; if it's missing, encode
     // like hammer.
@@ -1567,6 +1567,10 @@ void pg_pool_t::encode(bufferlist& bl, uint64_t features) const
   }
   if (v >= 25) {
     ::encode(last_force_op_resend, bl);
+  }
+  if (v >= 26) {
+    __u8 e = extensible_mode;
+    ::encode(e, bl);
   }
   ENCODE_FINISH(bl);
 }
@@ -1720,6 +1724,12 @@ void pg_pool_t::decode(bufferlist::iterator& bl)
   } else {
     last_force_op_resend = last_force_op_resend_preluminous;
   }
+
+  if (struct_v >= 26) {
+    __u8 v;
+    ::decode(v, bl);
+    extensible_mode = (extensible_tier_mode_t)v;
+  } 
   DECODE_FINISH(bl);
   calc_pg_masks();
   calc_grade_table();
