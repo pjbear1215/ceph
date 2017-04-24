@@ -2243,9 +2243,9 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_extensible_tier_detail(
     return cache_result_t::NOOP;
   } 
 
-  assert(obc->obs.oi.is_extend_tier());
+  assert(obc->obs.oi.has_manifest());
 #if 0
-  if (!obc->obs.oi.is_extend_tier()) {
+  if (!obc->obs.oi.has_manifest()) {
     return cache_result_t::NOOP;
   }
 #endif
@@ -4231,12 +4231,11 @@ void PrimaryLogPG::maybe_object_in_extensible_tier(ObjectState& obs)
 {
   if (pool.info.extensible_mode != pg_pool_t::EXTENSIBLEMODE_NONE) {
     if (!pool.info.has_tiers() && pool.info.is_tier()) {
-      obs.oi.set_flag(object_info_t::FLAG_EXTENSIBLE_TIER);
+      obs.oi.set_flag(object_info_t::FLAG_MANIFEST);
     }
     switch (pool.info.extensible_mode) {
     case pg_pool_t::EXTENSIBLEMODE_REDIRECT:
-      obs.oi.obj_manifest.type = object_manifest_t::TYPE_REDIRECT;
-      obs.oi.obj_manifest.redirect_target = ghobject_t(obs.oi.soid);
+      obs.oi.manifest.type = object_manifest_t::TYPE_REDIRECT;
       break;
     default:
       assert(0 == "unrecognized extensible_mode");
@@ -4791,7 +4790,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  if (result < 0)
 	    break;
 	}
-	if (oi.is_extend_tier()) {
+	if (oi.has_manifest()) {
 	  result = _truncate_oid(ctx);
 	} else {
 	  result = _delete_oid(ctx, true);
@@ -12237,7 +12236,7 @@ bool PrimaryLogPG::agent_maybe_evict(ObjectContextRef& obc, bool after_flush)
   ctx->at_version = get_next_version();
   assert(ctx->new_obs.exists);
   int r = -1;
-  if (obc->obs.oi.is_extend_tier()) {
+  if (obc->obs.oi.has_manifest()) {
     r = _truncate_oid(ctx.get());
   } else {
     r = _delete_oid(ctx.get(), true);
@@ -12249,7 +12248,7 @@ bool PrimaryLogPG::agent_maybe_evict(ObjectContextRef& obc, bool after_flush)
   if (obc->obs.oi.is_dirty())
     --ctx->delta_stats.num_objects_dirty;
   assert(r == 0);
-  if (!obc->obs.oi.is_extend_tier()) {
+  if (!obc->obs.oi.has_manifest()) {
     finish_ctx(ctx.get(), pg_log_entry_t::DELETE, false);
   }
   simple_opc_submit(std::move(ctx));
