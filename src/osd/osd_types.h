@@ -4011,6 +4011,8 @@ struct object_manifest_t {
   ghobject_t redirect_target;
 
   object_manifest_t() : type(0) { }
+  object_manifest_t(uint8_t type, const ghobject_t& redirect_target) 
+    : type(type), redirect_target(redirect_target) { }
 
   bool is_empty() const {
     return type == TYPE_NONE;
@@ -4026,6 +4028,7 @@ struct object_manifest_t {
   void decode(bufferlist::iterator &bl);
   void dump(Formatter *f) const;
 };
+WRITE_CLASS_ENCODER(object_manifest_t)
 
 struct object_info_t {
   hobject_t soid;

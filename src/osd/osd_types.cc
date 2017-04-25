@@ -4541,7 +4541,14 @@ void object_manifest_t::encode(bufferlist& bl) const
 {
   ENCODE_START(1, 1, bl);
   ::encode(type, bl);
-  ::encode(redirect_target, bl);
+  switch (type) {
+    case TYPE_NONE: break;
+    case TYPE_REDIRECT: 
+      ::encode(redirect_target, bl);
+      break;
+    default:
+      ceph_abort();
+  }
   ENCODE_FINISH(bl);
 }
 
@@ -4549,7 +4556,14 @@ void object_manifest_t::decode(bufferlist::iterator& bl)
 {
   DECODE_START(1, bl);
   ::decode(type, bl);
-  ::decode(redirect_target, bl);
+  switch (type) {
+    case TYPE_NONE: break;
+    case TYPE_REDIRECT: 
+      ::decode(redirect_target, bl);
+      break;
+    default:
+      ceph_abort();
+  }
   DECODE_FINISH(bl);
 }
 
