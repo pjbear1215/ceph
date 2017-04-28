@@ -5521,6 +5521,47 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       }
       break;
 
+    case CEPH_OSD_OP_EXTENSIBLE_REDIRECT:
+      ++ctx->num_write;
+      {
+	object_t target_name;
+	object_locator_t target_oloc;
+	snapid_t target_snapid = (uint64_t)op.copy_from.snapid;
+	version_t target_version = op.copy_from.src_version;
+	try {
+	  ::decode(target_name, bp);
+	  ::decode(target_oloc, bp);
+	}
+	catch (buffer::error& e) {
+	  result = -EINVAL;
+	  goto fail;
+	}
+	t->truncate(soid, 0);
+	t->omap_clear(soid);
+	/* rm_attrs */
+	map<string,bufferlist> rmattrs;
+	result = getattrs_maybe_cache(ctx->obc,
+				      &rmattrs,
+				      true);
+	if (result < 0) {
+	  return result;
+	}
+	map<string, bufferlist>::iterator iter;
+	for (iter = rmattrs.begin(); iter != rmattrs.end(); ++iter) {
+	  const string& name = iter->first;
+	  t->rmattr(soid, name);
+	}
+	/* set redirect target */
+	pg_t raw_pg;
+	get_osdmap()->object_locator_to_pg(target_name, target_oloc, raw_pg);
+	hobject_t target(target_name, target_oloc.key, target_snapid,
+		      raw_pg.ps(), raw_pg.pool(),
+		      target_oloc.nspace);
+	oi.manifest.redirect_target = ghobject_t(target);
+	oi.manifest.type = object_manifest_t::TYPE_REDIRECT;
+      }
+
+      break;
 
       // -- object attrs --
       
