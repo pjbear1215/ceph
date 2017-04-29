@@ -5521,7 +5521,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       }
       break;
 
-    case CEPH_OSD_OP_EXTENSIBLE_REDIRECT:
+    case CEPH_OSD_OP_SET_REDIRECT:
       ++ctx->num_write;
       {
 	object_t target_name;
@@ -5557,7 +5557,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	hobject_t target(target_name, target_oloc.key, target_snapid,
 		      raw_pg.ps(), raw_pg.pool(),
 		      target_oloc.nspace);
-	oi.manifest.redirect_target = ghobject_t(target);
+	oi.manifest.redirect_target = target;
 	oi.manifest.type = object_manifest_t::TYPE_REDIRECT;
       }
 

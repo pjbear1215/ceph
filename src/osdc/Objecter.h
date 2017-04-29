@@ -1081,7 +1081,7 @@ struct ObjectOperation {
    */
   void set_redirect(object_t tgt, snapid_t snapid, object_locator_t tgt_oloc, 
 		    version_t tgt_version) {
-    OSDOp& osd_op = add_op(CEPH_OSD_OP_EXTENSIBLE_REDIRECT);
+    OSDOp& osd_op = add_op(CEPH_OSD_OP_SET_REDIRECT);
     osd_op.op.copy_from.snapid = snapid;
     osd_op.op.copy_from.src_version = tgt_version;
     ::encode(tgt, osd_op.indata);
