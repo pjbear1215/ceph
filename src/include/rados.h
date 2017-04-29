@@ -169,7 +169,6 @@ extern const char *ceph_osd_state_name(int s);
 #define CEPH_OSD_OP_MODE_RMW   0x3000
 #define CEPH_OSD_OP_MODE_SUB   0x4000
 #define CEPH_OSD_OP_MODE_CACHE 0x8000
-#define CEPH_OSD_OP_MODE_EXTENSIBLE 0x9000
 
 #define CEPH_OSD_OP_TYPE       0x0f00
 #define CEPH_OSD_OP_TYPE_DATA  0x0200
@@ -265,7 +264,7 @@ extern const char *ceph_osd_state_name(int s);
 	f(WRITESAME,	__CEPH_OSD_OP(WR, DATA, 38),	"write-same")	    \
 									    \
 	/* Extensible */						    \
-	f(EXTENSIBLE_REDIRECT,	__CEPH_OSD_OP(EXTENSIBLE, DATA, 39),	"set-redirect")	    \
+	f(SET_REDIRECT,	__CEPH_OSD_OP(WR, DATA, 39),	"set-redirect")	    \
 									    \
 	/** attrs **/							    \
 	/* read */							    \

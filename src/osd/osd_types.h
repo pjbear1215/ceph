@@ -4008,10 +4008,10 @@ struct object_manifest_t {
     TYPE_CHUNKED = 2,   // do this later
   };
   uint8_t type;  // redirect, chunked, ...
-  ghobject_t redirect_target;
+  hobject_t redirect_target;
 
   object_manifest_t() : type(0) { }
-  object_manifest_t(uint8_t type, const ghobject_t& redirect_target) 
+  object_manifest_t(uint8_t type, const hobject_t& redirect_target) 
     : type(type), redirect_target(redirect_target) { }
 
   bool is_empty() const {
