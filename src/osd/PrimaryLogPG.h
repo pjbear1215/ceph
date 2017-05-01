@@ -1117,11 +1117,17 @@ protected:
 					   ObjectContextRef *promote_obc);
   cache_result_t maybe_handle_extensible_tier_detail(OpRequestRef op,
 					   bool write_ordered,
-					   ObjectContextRef obc, int r,
-					   hobject_t missing_oid,
-					   bool must_promote,
-					   bool in_hit_set,
-					   ObjectContextRef *promote_obc);
+					   ObjectContextRef obc);
+
+  bool maybe_handle_extensible_tier(OpRequestRef op,
+			  bool write_ordered,
+			  ObjectContextRef obc) {
+    return cache_result_t::NOOP != maybe_handle_extensible_tier_detail(
+      op,
+      write_ordered,
+      obc);
+  }
+
   /**
    * This helper function is called from do_op if the ObjectContext lookup fails.
    * @returns true if the caching code is handling the Op, false otherwise.
@@ -1133,17 +1139,6 @@ protected:
 			  bool must_promote,
 			  bool in_hit_set = false) {
     
-    if (pool.info.extensible_mode != pg_pool_t::EXTENSIBLEMODE_NONE) {
-      return cache_result_t::NOOP != maybe_handle_extensible_tier_detail(
-	op,
-	write_ordered,
-	obc,
-	r,
-	missing_oid,
-	must_promote,
-	in_hit_set,
-	nullptr);
-    } 
     return cache_result_t::NOOP != maybe_handle_cache_detail(
       op,
       write_ordered,
@@ -1336,7 +1331,7 @@ protected:
   // -- proxyread --
   map<ceph_tid_t, ProxyReadOpRef> proxyread_ops;
 
-  void do_proxy_read(OpRequestRef op);
+  void do_proxy_read(OpRequestRef op, ObjectContextRef obc = NULL);
   void finish_proxy_read(hobject_t oid, ceph_tid_t tid, int r);
   void cancel_proxy_read(ProxyReadOpRef prdop);
 
@@ -1345,7 +1340,7 @@ protected:
   // -- proxywrite --
   map<ceph_tid_t, ProxyWriteOpRef> proxywrite_ops;
 
-  void do_proxy_write(OpRequestRef op, const hobject_t& missing_oid);
+  void do_proxy_write(OpRequestRef op, const hobject_t& missing_oid, ObjectContextRef obc = NULL);
   void finish_proxy_write(hobject_t oid, ceph_tid_t tid, int r);
   void cancel_proxy_write(ProxyWriteOpRef pwop);
 

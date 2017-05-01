@@ -4621,7 +4621,7 @@ void object_info_t::encode(bufferlist& bl, uint64_t features) const
        ++i) {
     old_watchers.insert(make_pair(i->first.second, i->second));
   }
-  ENCODE_START(16, 8, bl);
+  ENCODE_START(17, 8, bl);
   ::encode(soid, bl);
   ::encode(myoloc, bl);	//Retained for compatibility
   ::encode((__u32)0, bl); // was category, no longer used
@@ -4652,6 +4652,7 @@ void object_info_t::encode(bufferlist& bl, uint64_t features) const
   ::encode(expected_object_size, bl);
   ::encode(expected_write_size, bl);
   ::encode(alloc_hint_flags, bl);
+  ::encode(manifest, bl);
   ENCODE_FINISH(bl);
 }
 
@@ -4739,6 +4740,9 @@ void object_info_t::decode(bufferlist::iterator& bl)
     expected_object_size = 0;
     expected_write_size = 0;
     alloc_hint_flags = 0;
+  }
+  if (struct_v >= 17) {
+    ::decode(manifest, bl);
   }
   DECODE_FINISH(bl);
 }

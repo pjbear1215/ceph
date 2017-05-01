@@ -2064,6 +2064,14 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     if (agent_choose_mode(false, op))
       return;
   }
+
+  if (obc.get() && obc->obs.exists && obc->obs.oi.has_manifest()) {
+    if (maybe_handle_extensible_tier(op,
+				     write_ordered,
+				     obc))
+    return;
+  }
+
   if (maybe_handle_cache(op,
 			 write_ordered,
 			 obc,
@@ -2211,21 +2219,13 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
 PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_extensible_tier_detail(
   OpRequestRef op,
   bool write_ordered,
-  ObjectContextRef obc,
-  int r, hobject_t missing_oid,
-  bool must_promote,
-  bool in_hit_set,
-  ObjectContextRef *promote_obc)
+  ObjectContextRef obc)
 {
   if (obc)
     dout(10) << __func__ << " " << obc->obs.oi << " "
 	     << (obc->obs.exists ? "exists" : "DNE")
-	     << " missing_oid " << missing_oid
 	     << dendl;
-  else
-    dout(10) << __func__ << " (no obc)"
-	     << " missing_oid " << missing_oid
-	     << dendl;
+
   // if it is write-ordered and blocked, stop now
   if (obc.get() && obc->is_blocked() && write_ordered) {
     // we're already doing something with this object
@@ -2233,75 +2233,17 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_extensible_tier_detail(
     return cache_result_t::NOOP;
   }
 
-  if (r == -ENOENT && missing_oid == hobject_t()) {
-    // we know this object is logically absent (e.g., an undefined clone)
-    return cache_result_t::NOOP;
-  }
-
-  // New object ? --> should be stored in the base pool
-  if (!obc->obs.exists) {
-    return cache_result_t::NOOP;
-  } 
-
-  assert(obc->obs.oi.has_manifest());
-#if 0
-  if (!obc->obs.oi.has_manifest()) {
-    return cache_result_t::NOOP;
-  }
-#endif
-
-  // Already in the base pool
-  if (obc->obs.exists && (obc->obs.oi.size > 0)) {
-    return cache_result_t::NOOP;
-  }
-
-  if (missing_oid == hobject_t() && obc.get()) {
-    missing_oid = obc->obs.oi.soid;
-  }
-  const MOSDOp *m = static_cast<const MOSDOp*>(op->get_req());
-  const object_locator_t oloc = m->get_object_locator();
-
-  OpRequestRef promote_op;
-  // The metadata exists in the base pool, but the data doesn't exist in the base pool
-  switch (pool.info.extensible_mode) {
-  case pg_pool_t::EXTENSIBLEMODE_REDIRECT:
-    if (agent_state &&
-	agent_state->evict_mode == TierAgentState::EVICT_MODE_FULL) {
-      if (!op->may_write() && !op->may_cache() &&
-	  !write_ordered) {
-	dout(20) << __func__ << " extended pool full, proxying read" << dendl;
-	do_proxy_read(op);
-	return cache_result_t::HANDLED_PROXY;
-      }
-      dout(20) << __func__ << " base pool full, waiting" << dendl;
-      block_write_on_full_cache(missing_oid, op);
-      return cache_result_t::BLOCKED_FULL;
-    }
-
-    if (op->may_write() || op->may_cache()) {
-      promote_object(obc, missing_oid, oloc, op, promote_obc);
-      return cache_result_t::BLOCKED_PROMOTE;
+  switch (obc->obs.oi.manifest.type) {
+  case object_manifest_t::TYPE_REDIRECT:
+    if (op->may_write() || write_ordered) {
+      do_proxy_write(op, obc->obs.oi.soid, obc);
     } else {
-      do_proxy_read(op);
-
-      // Avoid duplicate promotion
-      if (obc.get() && obc->is_blocked()) {
-	if (promote_obc)
-	  *promote_obc = obc;
-        return cache_result_t::BLOCKED_PROMOTE;
-      }
-
-      if (!op->need_skip_promote()) {
-	(void)maybe_promote(obc, missing_oid, oloc, in_hit_set,
-			    pool.info.min_read_recency_for_promote,
-			    promote_op, promote_obc);
-      }
-
-      return cache_result_t::HANDLED_PROXY;
+      do_proxy_read(op, obc);
     }
-  case pg_pool_t::EXTENSIBLEMODE_CHUNKED:
+    return cache_result_t::HANDLED_PROXY;
+  case object_manifest_t::TYPE_CHUNKED:
   default:
-    assert(0 == "unrecognized extend_mode");
+    assert(0 == "unrecognized extensible_mode");
   }
 
   return cache_result_t::NOOP;
@@ -2667,15 +2609,31 @@ struct C_ProxyRead : public Context {
   }
 };
 
-void PrimaryLogPG::do_proxy_read(OpRequestRef op)
+void PrimaryLogPG::do_proxy_read(OpRequestRef op, ObjectContextRef obc)
 {
   // NOTE: non-const here because the ProxyReadOp needs mutable refs to
   // stash the result in the request's OSDOp vector
   MOSDOp *m = static_cast<MOSDOp*>(op->get_nonconst_req());
-  object_locator_t oloc(m->get_object_locator());
-  oloc.pool = pool.info.tier_of;
+  object_locator_t oloc;
 
-  const hobject_t& soid = m->get_hobj();
+  hobject_t soid;
+  /* extensible tier */
+  if (obc && obc->obs.exists && obc->obs.oi.has_manifest()) {
+    switch (obc->obs.oi.manifest.type) {
+      case object_manifest_t::TYPE_REDIRECT:
+	  oloc = object_locator_t(obc->obs.oi.manifest.redirect_target);
+	  soid = obc->obs.oi.manifest.redirect_target;  
+	  break;
+      case object_manifest_t::TYPE_CHUNKED:
+      default:
+	assert(0 == "unrecognized extensible_mode");
+    }
+  } else {
+  /* proxy */
+    soid = m->get_hobj();
+    oloc = object_locator_t(m->get_object_locator());
+    oloc.pool = pool.info.tier_of;
+  }
   unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY;
 
   // pass through some original flags that make sense.
@@ -2858,15 +2816,32 @@ struct C_ProxyWrite_Commit : public Context {
   }
 };
 
-void PrimaryLogPG::do_proxy_write(OpRequestRef op, const hobject_t& missing_oid)
+void PrimaryLogPG::do_proxy_write(OpRequestRef op, const hobject_t& missing_oid, ObjectContextRef obc)
 {
   // NOTE: non-const because ProxyWriteOp takes a mutable ref
   MOSDOp *m = static_cast<MOSDOp*>(op->get_nonconst_req());
-  object_locator_t oloc(m->get_object_locator());
-  oloc.pool = pool.info.tier_of;
+  object_locator_t oloc;
   SnapContext snapc(m->get_snap_seq(), m->get_snaps());
 
-  const hobject_t& soid = m->get_hobj();
+  hobject_t soid;
+  /* extensible tier */
+  if (obc && obc->obs.exists && obc->obs.oi.has_manifest()) {
+    switch (obc->obs.oi.manifest.type) {
+      case object_manifest_t::TYPE_REDIRECT:
+	  oloc = object_locator_t(obc->obs.oi.manifest.redirect_target);
+	  soid = obc->obs.oi.manifest.redirect_target;  
+	  break;
+      case object_manifest_t::TYPE_CHUNKED:
+      default:
+	assert(0 == "unrecognized extensible_mode");
+    }
+  } else {
+  /* proxy */
+    soid = m->get_hobj();
+    oloc = object_locator_t(m->get_object_locator());
+    oloc.pool = pool.info.tier_of;
+  }
+
   unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY;
   dout(10) << __func__ << " Start proxy write for " << *m << dendl;
 
@@ -6305,16 +6280,11 @@ int PrimaryLogPG::_rollback_to(OpContext *ctx, ceph_osd_op& op)
   {
     ObjectContextRef promote_obc;
     cache_result_t tier_mode_result;
-    if (pool.info.extensible_mode != pg_pool_t::EXTENSIBLEMODE_NONE) {
+    if (obs.exists && obs.oi.has_manifest()) {
       tier_mode_result = maybe_handle_extensible_tier_detail(
 			  ctx->op,
 			  true,
-			  rollback_to,
-			  ret,
-			  missing_oid,
-			  true,
-			  false,
-			  &promote_obc);
+			  rollback_to);
     } else {
       tier_mode_result = maybe_handle_cache_detail(
 			  ctx->op,
