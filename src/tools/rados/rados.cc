@@ -120,6 +120,10 @@ void usage(ostream& out)
 "   listwatchers <obj-name>          list the watchers of this object\n"
 "   set-alloc-hint <obj-name> <expected-object-size> <expected-write-size>\n"
 "                                    set allocation hint for an object\n"
+"   set-redirect <object A> --target-pool <caspool> <target object A>\n"
+"                                    set redirect target\n"
+"   set-chunk <object A> --target-pool <caspool> <chunk-length>\n"
+"                                    convert an object to chunked object\n"
 "\n"
 "IMPORT AND EXPORT\n"
 "   export [filename]\n"
@@ -3456,6 +3460,36 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
     ret = io_ctx.operate(nargs[1], &op);
     if (ret < 0) {
       cerr << "error set-redirect " << pool_name << "/" << nargs[1] << " => " << target << "/" << target_obj << ": " << cpp_strerror(ret) << std::endl;
+      goto out;
+    }
+  } else if (strcmp(nargs[0], "set-chunk") == 0) {
+    if (!pool_name)
+      usage_exit();
+
+    const char *target = target_pool_name;
+    if (!target)
+      target = pool_name;
+
+    uint64_t chunk_length;
+    if (nargs.size() < 3) {
+      usage_exit();
+    } else {
+      char* endptr = NULL;
+      chunk_length = strtoull(nargs[2], &endptr, 10);
+      if (*endptr) {
+	cerr << "Invalid value for size: '" << nargs[2] << "'" << std::endl;
+	ret = -EINVAL;
+	goto out;
+      }
+    }
+
+    IoCtx target_ctx;
+    ret = rados.ioctx_create(target, target_ctx);
+    ObjectWriteOperation op;
+    op.set_chunk(target_ctx, chunk_length);
+    ret = io_ctx.operate(nargs[1], &op);
+    if (ret < 0) {
+      cerr << "error set-chunk " << pool_name << "/" << nargs[1] << "  " << " chunk_length: " << chunk_length << " : " << cpp_strerror(ret) << std::endl;
       goto out;
     }
   } else if (strcmp(nargs[0], "export") == 0) {

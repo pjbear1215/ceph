@@ -471,6 +471,7 @@ namespace librados
      */
     void set_redirect(const std::string& tgt_obj, const IoCtx& tgt_ioctx,
 		      uint64_t tgt_version);
+    void set_chunk(const IoCtx& tgt_ioctx, uint64_t chunk_length);
 
     friend class IoCtx;
   };

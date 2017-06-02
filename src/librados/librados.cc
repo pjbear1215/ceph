@@ -614,6 +614,13 @@ void librados::ObjectWriteOperation::set_redirect(const std::string& tgt_obj,
 			  tgt_ioctx.io_ctx_impl->oloc, tgt_version);
 }
 
+void librados::ObjectWriteOperation::set_chunk(const IoCtx& tgt_ioctx,
+					       uint64_t chunk_length)
+{
+  ::ObjectOperation *o = &impl->o;
+  o->set_chunk(tgt_ioctx.io_ctx_impl->oloc, chunk_length);
+}
+
 void librados::ObjectWriteOperation::tmap_put(const bufferlist &bl)
 {
   ::ObjectOperation *o = &impl->o;
