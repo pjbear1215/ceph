@@ -5958,6 +5958,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  result = -EINVAL;
 	  break;
 	}
+	oi.set_flag(object_info_t::FLAG_MANIFEST);
 	oi.manifest.redirect_target = target;
 	oi.manifest.type = object_manifest_t::TYPE_REDIRECT;
 	t->truncate(soid, 0);
@@ -5985,6 +5986,78 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  t->rmattr(soid, name);
 	}
 	dout(10) << "set-redirect oid:" << oi.soid << " user_version: " << oi.user_version << dendl;
+      }
+
+      break;
+
+    case CEPH_OSD_OP_SET_CHUNK:
+      ++ctx->num_write;
+      {
+	if (pool.info.is_tier()) {
+	  result = -EINVAL;
+	  break;
+	}
+	if (!obs.exists) {
+	  result = -ENOENT;
+	  break;
+	}
+	if (get_osdmap()->require_osd_release < CEPH_RELEASE_LUMINOUS) {
+	  result = -EOPNOTSUPP;
+	  break;
+	}
+
+	object_locator_t target_oloc;
+	uint64_t chunk_length;
+	try {
+	  ::decode(target_oloc, bp);
+	  ::decode(chunk_length, bp);
+	}
+	catch (buffer::error& e) {
+	  result = -EINVAL;
+	  goto fail;
+	}
+	
+	if (!chunk_length) {
+	  result = -EINVAL;
+	  goto fail;
+	}
+
+	for (uint64_t cursor = 0; cursor <= oi.size; cursor += chunk_length) {
+	  pg_t raw_pg;
+	  string chunk_name = soid.oid.name;
+	  get_osdmap()->object_locator_to_pg(chunk_name, target_oloc, raw_pg);
+	  hobject_t target(chunk_name, target_oloc.key, snapid_t(),
+			   raw_pg.ps(), raw_pg.pool(),
+			   target_oloc.nspace);
+	  chunk_info_t chunk_info;
+	  chunk_info.length = chunk_length;
+	  chunk_info.oid = target;
+	  chunk_info.flags = chunk_info_t::FLAG_DIRTY;
+	  oi.manifest.chunk_map[cursor] = chunk_info;
+	}
+
+	if (!oi.manifest.is_chunked()) {
+	  oi.manifest.clear();
+	}
+	oi.set_flag(object_info_t::FLAG_MANIFEST);
+	oi.manifest.type = object_manifest_t::TYPE_CHUNKED;
+	ctx->modify = true;
+	ctx->delta_stats.num_bytes -= oi.size;
+	oi.size = 0;
+	oi.new_object();
+	map<string,bufferlist> rmattrs;
+	result = getattrs_maybe_cache(ctx->obc,
+		    &rmattrs,
+		    true);
+	if (result < 0) {
+	  return result;
+	}
+	map<string, bufferlist>::iterator iter;
+	for (iter = rmattrs.begin(); iter != rmattrs.end(); ++iter) {
+	  const string& name = iter->first;
+	  t->rmattr(soid, name);
+	}
+	dout(10) << "set-chunked oid:" << oi.soid << " user_version: " << oi.user_version << dendl;
       }
 
       break;

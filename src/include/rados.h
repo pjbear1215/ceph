@@ -297,6 +297,7 @@ extern int ceph_release_from_name(const char *s);
 									    \
 	/* Extensible */						    \
 	f(SET_REDIRECT,	__CEPH_OSD_OP(WR, DATA, 39),	"set-redirect")	    \
+	f(SET_CHUNK,	__CEPH_OSD_OP(WR, DATA, 40),	"set-chunk")	    \
 									    \
 	/** attrs **/							    \
 	/* read */							    \
