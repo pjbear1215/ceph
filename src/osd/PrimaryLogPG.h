@@ -1296,6 +1296,10 @@ protected:
   void cancel_flush(FlushOpRef fop, bool requeue);
   void cancel_flush_ops(bool requeue);
 
+  // manifest
+  int do_manifest_flush(OpRequestRef op, ObjectContextRef obc,
+			SnapContext &snapc, FlushOpRef fop);
+
   /// @return false if clone is has been evicted
   bool is_present_clone(hobject_t coid);
 
