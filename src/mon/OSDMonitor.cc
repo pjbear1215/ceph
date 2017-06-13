@@ -5884,6 +5884,7 @@ int OSDMonitor::prepare_command_pool_set(map<string,cmd_vartype> &cmdmap,
     uf = llrintl(f * (double)1000000.0);
   }
 
+#if 0
   if (!p.is_tier() &&
       (var == "hit_set_type" || var == "hit_set_period" ||
        var == "hit_set_count" || var == "hit_set_fpp" ||
@@ -5895,6 +5896,7 @@ int OSDMonitor::prepare_command_pool_set(map<string,cmd_vartype> &cmdmap,
        var == "min_read_recency_for_promote" || var == "min_write_recency_for_promote")) {
     return -EACCES;
   }
+#endif
 
   if (var == "size") {
     if (p.has_flag(pg_pool_t::FLAG_NOSIZECHANGE)) {
