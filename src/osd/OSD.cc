@@ -610,7 +610,7 @@ void OSDService::agent_entry()
     }
     uint64_t level = agent_queue.rbegin()->first;
     set<PGRef>& top = agent_queue.rbegin()->second;
-    dout(10) << __func__
+    dout(0) << __func__
 	     << " tiers " << agent_queue.size()
 	     << ", top is " << level
 	     << " with pgs " << top.size()
@@ -633,12 +633,12 @@ void OSDService::agent_entry()
       agent_valid_iterator = true;
     }
     PGRef pg = *agent_queue_pos;
-    dout(10) << "high_count " << flush_mode_high_count
+    dout(0) << "high_count " << flush_mode_high_count
 	     << " agent_ops " << agent_ops
 	     << " flush_quota " << agent_flush_quota << dendl;
     agent_lock.Unlock();
     if (!pg->agent_work(max, agent_flush_quota)) {
-      dout(10) << __func__ << " " << pg->get_pgid()
+      dout(0) << __func__ << " " << pg->get_pgid()
 	<< " no agent_work, delay for " << cct->_conf->osd_agent_delay_time
 	<< " seconds" << dendl;
 

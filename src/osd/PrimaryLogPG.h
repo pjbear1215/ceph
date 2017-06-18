@@ -95,6 +95,7 @@ public:
     map<string, bufferlist> attrs; // xattrs
     uint64_t truncate_seq;
     uint64_t truncate_size;
+    int ret;
     bool is_data_digest() {
       return flags & object_copy_data_t::FLAG_DATA_DIGEST;
     }
@@ -113,6 +114,8 @@ public:
     {}
   };
 
+  struct CopyOp;
+  typedef ceph::shared_ptr<CopyOp> CopyOpRef;
   struct CopyOp {
     CopyCallback *cb;
     ObjectContextRef obc;
@@ -144,6 +147,9 @@ public:
      */
     unsigned src_obj_fadvise_flags;
     unsigned dest_obj_fadvise_flags;
+    map<uint64_t, CopyOpRef> io_results;
+    uint64_t num_chunk_result;
+    bool failed;
 
     CopyOp(CopyCallback *cb_, ObjectContextRef _obc, hobject_t s,
 	   object_locator_t l,
@@ -162,9 +168,9 @@ public:
     {
       results.user_version = v;
       results.mirror_snapset = mirror_snapset;
+      failed = false;
     }
   };
-  typedef ceph::shared_ptr<CopyOp> CopyOpRef;
 
   /**
    * The CopyCallback class defines an interface for completions to the
@@ -178,6 +184,7 @@ public:
 
   friend class CopyFromCallback;
   friend class PromoteCallback;
+  friend class ManifestPromoteCallback;
 
   struct ProxyReadOp {
     OpRequestRef op;
@@ -1263,8 +1270,14 @@ protected:
 		  object_locator_t oloc, version_t version, unsigned flags,
 		  bool mirror_snapset, unsigned src_obj_fadvise_flags,
 		  unsigned dest_obj_fadvise_flags);
+  void start_copy_manifest(CopyCallback *cb, ObjectContextRef obc, hobject_t src,
+		  object_locator_t oloc, version_t version, unsigned flags,
+		  bool mirror_snapset, unsigned src_obj_fadvise_flags,
+		  unsigned dest_obj_fadvise_flags);
   void process_copy_chunk(hobject_t oid, ceph_tid_t tid, int r);
+  void process_copy_chunk_manifest(hobject_t oid, ceph_tid_t tid, int r, uint64_t offset);
   void _write_copy_chunk(CopyOpRef cop, PGTransaction *t);
+  void _write_copy_chunk_manifest(CopyOpRef cop, PGTransaction *t);
   uint64_t get_copy_chunk_size() const {
     uint64_t size = cct->_conf->osd_copyfrom_max_chunk;
     if (pool.info.requires_aligned_append()) {
@@ -1276,12 +1289,15 @@ protected:
     return size;
   }
   void _copy_some(ObjectContextRef obc, CopyOpRef cop);
+  void _copy_some_manifest(ObjectContextRef obc, CopyOpRef cop);
   void finish_copyfrom(OpContext *ctx);
   void finish_promote(int r, CopyResults *results, ObjectContextRef obc);
+  void finish_promote_manifest(int r, CopyResults *results, ObjectContextRef obc);
   void cancel_copy(CopyOpRef cop, bool requeue);
   void cancel_copy_ops(bool requeue);
 
   friend struct C_Copyfrom;
+  friend struct C_Copyfrom_Manifest;
 
   // -- flush --
   map<hobject_t, FlushOpRef> flush_ops;

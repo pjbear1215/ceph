@@ -76,6 +76,8 @@ static ostream& _prefix(std::ostream *_dout, T *pg) {
 
 #include <errno.h>
 
+#include "Dedup.h"
+
 MEMPOOL_DEFINE_OBJECT_FACTORY(PrimaryLogPG, replicatedpg, osd);
 
 PGLSFilter::PGLSFilter() : cct(nullptr)
@@ -3331,6 +3333,24 @@ public:
   }
 };
 
+class ManifestPromoteCallback: public PrimaryLogPG::CopyCallback {
+  ObjectContextRef obc;
+  PrimaryLogPG *pg;
+  utime_t start;
+public:
+  ManifestPromoteCallback(ObjectContextRef obc_, PrimaryLogPG *pg_)
+    : obc(obc_),
+      pg(pg_),
+      start(ceph_clock_now()) {}
+
+  void finish(PrimaryLogPG::CopyCallbackResults results) override {
+    PrimaryLogPG::CopyResults *results_data = results.get<1>();
+    int r = results.get<0>();
+    pg->finish_promote_manifest(r, results_data, obc);
+    pg->osd->logger->tinc(l_osd_tier_promote_lat, ceph_clock_now() - start);
+  }
+};
+
 void PrimaryLogPG::promote_object(ObjectContextRef obc,
 				  const hobject_t& missing_oid,
 				  const object_locator_t& oloc,
@@ -3370,6 +3390,10 @@ void PrimaryLogPG::promote_object(ObjectContextRef obc,
     src_fadvise_flags |= LIBRADOS_OP_FLAG_FADVISE_DONTNEED;
   }
 
+  unsigned flags = CEPH_OSD_COPY_FROM_FLAG_IGNORE_OVERLAY |
+                   CEPH_OSD_COPY_FROM_FLAG_IGNORE_CACHE |
+                   CEPH_OSD_COPY_FROM_FLAG_MAP_SNAP_CLONE |
+                   CEPH_OSD_COPY_FROM_FLAG_RWORDERED;
   PromoteCallback *cb = new PromoteCallback(obc, this);
   object_locator_t my_oloc = oloc;
   my_oloc.pool = pool.info.tier_of;
@@ -3378,15 +3402,21 @@ void PrimaryLogPG::promote_object(ObjectContextRef obc,
       object_locator_t chunk_oloc(obc->obs.oi.manifest.chunk_map[0].oid);
       my_oloc = chunk_oloc;
     }
+    delete cb;
+    ManifestPromoteCallback *mcb = new ManifestPromoteCallback(obc, this);
+    start_copy_manifest(mcb, obc, obc->obs.oi.soid, my_oloc, 0, flags,
+			 obc->obs.oi.soid.snap == CEPH_NOSNAP,
+			 src_fadvise_flags, 0);
+    if (op)
+      wait_for_blocked_object(obc->obs.oi.soid, op);
+    info.stats.stats.sum.num_promote++;
   }
 
-  unsigned flags = CEPH_OSD_COPY_FROM_FLAG_IGNORE_OVERLAY |
-                   CEPH_OSD_COPY_FROM_FLAG_IGNORE_CACHE |
-                   CEPH_OSD_COPY_FROM_FLAG_MAP_SNAP_CLONE |
-                   CEPH_OSD_COPY_FROM_FLAG_RWORDERED;
+  if (!obc->obs.oi.has_manifest()) {
   start_copy(cb, obc, obc->obs.oi.soid, my_oloc, 0, flags,
 	     obc->obs.oi.soid.snap == CEPH_NOSNAP,
 	     src_fadvise_flags, 0);
+  }
 
   assert(obc->is_blocked());
 
@@ -5893,6 +5923,10 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	    soid, op.extent.offset, op.extent.length, osd_op.indata, op.flags);
 	}
 
+	dout(0) << __func__ << " oid: " << soid.oid << " offset: " << op.extent.offset 
+		<< " length: " << op.extent.length 
+		<< " oi.size: " << oi.size << dendl;
+
 	if (op.extent.offset == 0 && op.extent.length >= oi.size)
 	  obs.oi.set_data_digest(osd_op.indata.crc32c(-1));
 	else if (op.extent.offset == oi.size && obs.oi.is_data_digest())
@@ -5931,6 +5965,10 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  t->write(soid, 0, op.extent.length, osd_op.indata, op.flags);
 	}
 	obs.oi.set_data_digest(osd_op.indata.crc32c(-1));
+
+	dout(0) << __func__ << " writefull oid: " << soid.oid << " offset: " << op.extent.offset 
+		<< " length: " << op.extent.length 
+		<< " oi.size: " << oi.size << dendl;
 
 	write_update_size_and_usage(ctx->delta_stats, oi, ctx->modified_ranges,
 	    0, op.extent.length, true);
@@ -7272,13 +7310,14 @@ void PrimaryLogPG::make_writeable(OpContext *ctx)
   if (ctx->new_obs.exists) {
     // we will mark the object dirty
     if (ctx->undirty && was_dirty) {
-      dout(20) << " clearing DIRTY flag" << dendl;
+      dout(0) << " clearing DIRTY flag" << dendl;
       assert(ctx->new_obs.oi.is_dirty());
       ctx->new_obs.oi.clear_flag(object_info_t::FLAG_DIRTY);
       --ctx->delta_stats.num_objects_dirty;
       osd->logger->inc(l_osd_tier_clean);
     } else if (!was_dirty && !ctx->undirty) {
-      dout(20) << " setting DIRTY flag" << dendl;
+      dout(0) << " setting DIRTY flag" << dendl;
+      dout(0) << " num_objects_dirty " << ctx->delta_stats.num_objects_dirty << dendl;
       ctx->new_obs.oi.set_flag(object_info_t::FLAG_DIRTY);
       ++ctx->delta_stats.num_objects_dirty;
       osd->logger->inc(l_osd_tier_dirty);
@@ -7442,6 +7481,7 @@ void PrimaryLogPG::write_update_size_and_usage(object_stat_sum_t& delta_stats, o
     uint64_t new_size = offset + length;
     delta_stats.num_bytes -= oi.size;
     delta_stats.num_bytes += new_size;
+    dout(0) << __func__ << " new size: " << new_size << " oi.size: " << oi.size << dendl;
     oi.size = new_size;
   }
   delta_stats.num_wr++;
@@ -7941,6 +7981,29 @@ struct C_CopyFrom_AsyncReadCb : public Context {
   }
 };
 
+struct C_Copyfrom_Manifest : public Context {
+  PrimaryLogPGRef pg;
+  hobject_t oid;
+  epoch_t last_peering_reset;
+  ceph_tid_t tid;
+  PrimaryLogPG::CopyOpRef cop;
+  uint64_t offset;
+  C_Copyfrom_Manifest(PrimaryLogPG *p, hobject_t o, epoch_t lpr,
+	     const PrimaryLogPG::CopyOpRef& c)
+    : pg(p), oid(o), last_peering_reset(lpr),
+      tid(0), cop(c)
+  {}
+  void finish(int r) override {
+    if (r == -ECANCELED)
+      return;
+    pg->lock();
+    if (last_peering_reset == pg->get_last_peering_reset()) {
+      pg->process_copy_chunk_manifest(oid, tid, r, offset);
+    }
+    pg->unlock();
+  }
+};
+
 int PrimaryLogPG::fill_in_copy_get(
   OpContext *ctx,
   bufferlist::iterator& bp,
@@ -8164,6 +8227,40 @@ void PrimaryLogPG::start_copy(CopyCallback *cb, ObjectContextRef obc,
   _copy_some(obc, cop);
 }
 
+void PrimaryLogPG::start_copy_manifest(CopyCallback *cb, ObjectContextRef obc,
+			      hobject_t src, object_locator_t oloc,
+			      version_t version, unsigned flags,
+			      bool mirror_snapset,
+			      unsigned src_obj_fadvise_flags,
+			      unsigned dest_obj_fadvise_flags)
+{
+  const hobject_t& dest = obc->obs.oi.soid;
+  dout(10) << __func__ << " " << dest
+	   << " from " << src << " " << oloc << " v" << version
+	   << " flags " << flags
+	   << (mirror_snapset ? " mirror_snapset" : "")
+	   << dendl;
+
+  assert(!mirror_snapset || (src.snap == CEPH_NOSNAP ||
+			     src.snap == CEPH_SNAPDIR));
+
+  // cancel a previous in-progress copy?
+  if (copy_ops.count(dest)) {
+    // FIXME: if the src etc match, we could avoid restarting from the
+    // beginning.
+    CopyOpRef cop = copy_ops[dest];
+    cancel_copy(cop, false);
+  }
+
+  CopyOpRef cop(std::make_shared<CopyOp>(cb, obc, src, oloc, version, flags,
+			   mirror_snapset, src_obj_fadvise_flags,
+			   dest_obj_fadvise_flags));
+  copy_ops[dest] = cop;
+  obc->start_block();
+
+  _copy_some_manifest(obc, cop);
+}
+
 void PrimaryLogPG::_copy_some(ObjectContextRef obc, CopyOpRef cop)
 {
   dout(10) << __func__ << " " << obc << " " << cop << dendl;
@@ -8228,6 +8325,114 @@ void PrimaryLogPG::_copy_some(ObjectContextRef obc, CopyOpRef cop)
   fin->tid = tid;
   cop->objecter_tid = tid;
   gather.activate();
+}
+
+void PrimaryLogPG::_copy_some_manifest(ObjectContextRef obc, CopyOpRef cop)
+{
+  dout(10) << __func__ << " " << obc << " " << cop << dendl;
+
+  unsigned flags = 0;
+  if (cop->flags & CEPH_OSD_COPY_FROM_FLAG_FLUSH)
+    flags |= CEPH_OSD_FLAG_FLUSH;
+  if (cop->flags & CEPH_OSD_COPY_FROM_FLAG_IGNORE_CACHE)
+    flags |= CEPH_OSD_FLAG_IGNORE_CACHE;
+  if (cop->flags & CEPH_OSD_COPY_FROM_FLAG_IGNORE_OVERLAY)
+    flags |= CEPH_OSD_FLAG_IGNORE_OVERLAY;
+  if (cop->flags & CEPH_OSD_COPY_FROM_FLAG_MAP_SNAP_CLONE)
+    flags |= CEPH_OSD_FLAG_MAP_SNAP_CLONE;
+  if (cop->flags & CEPH_OSD_COPY_FROM_FLAG_RWORDERED)
+    flags |= CEPH_OSD_FLAG_RWORDERED;
+
+  //C_GatherBuilder gather(cct);
+
+#if 0
+  if (cop->cursor.is_initial() && cop->mirror_snapset) {
+    // list snaps too.
+    assert(cop->src.snap == CEPH_NOSNAP);
+    ObjectOperation op;
+    op.list_snaps(&cop->results.snapset, NULL);
+    ceph_tid_t tid = osd->objecter->read(cop->src.oid, cop->oloc, op,
+				    CEPH_SNAPDIR, NULL,
+				    flags, gather.new_sub(), NULL);
+    cop->objecter_tid2 = tid;
+  }
+#endif
+
+  object_manifest_t *manifest = &obc->obs.oi.manifest;
+  int num_chunk = 0;
+  map<uint64_t, chunk_info_t>::iterator iter = manifest->chunk_map.begin();
+  for (;iter != manifest->chunk_map.end(); ++iter) {
+    num_chunk++; 
+  }
+  cop->num_chunk_result = num_chunk;
+
+  iter = manifest->chunk_map.begin();
+  for (;iter != manifest->chunk_map.end(); ++iter) {
+    uint64_t offset = iter->first;
+    uint64_t length = manifest->chunk_map[iter->first].length;
+    hobject_t soid = manifest->chunk_map[iter->first].oid;
+    object_locator_t oloc(soid);
+
+    ObjectOperation op;
+    //cop->cursor.data_offset = offset;
+    CopyOpRef sub_cop(std::make_shared<CopyOp>(cop->cb, cop->obc, cop->src, cop->oloc, cop->results.user_version, cop->flags,
+				   cop->mirror_snapset, cop->src_obj_fadvise_flags,
+				   cop->dest_obj_fadvise_flags));
+    cop->io_results[offset] = sub_cop;
+#if 0
+    op.copy_get(&cop->cursor, length,
+		&cop->results.object_size, &cop->results.mtime,
+		&cop->attrs, &cop->data, &cop->omap_header, &cop->omap_data,
+		&cop->results.snaps, &cop->results.snap_seq,
+		&cop->results.flags,
+		&cop->results.source_data_digest,
+		&cop->results.source_omap_digest,
+		&cop->results.reqids,
+		&cop->results.truncate_seq,
+		&cop->results.truncate_size,
+		&cop->rval);
+#endif
+    op.copy_get(&sub_cop->cursor, length,
+		&sub_cop->results.object_size, &sub_cop->results.mtime,
+		&sub_cop->attrs, &sub_cop->data, &sub_cop->omap_header, &sub_cop->omap_data,
+		&sub_cop->results.snaps, &sub_cop->results.snap_seq,
+		&sub_cop->results.flags,
+		&sub_cop->results.source_data_digest,
+		&sub_cop->results.source_omap_digest,
+		&sub_cop->results.reqids,
+		&sub_cop->results.truncate_seq,
+		&sub_cop->results.truncate_size,
+		&sub_cop->rval);
+    op.set_last_op_flags(cop->src_obj_fadvise_flags);
+    C_Copyfrom_Manifest *fin = new C_Copyfrom_Manifest(this, obc->obs.oi.soid,
+						 get_last_peering_reset(), cop);
+
+    dout(0) << __func__ << " " << obc << " " << cop << " oid: " << soid.oid << " offset: " << offset << dendl;
+    ceph_tid_t tid = osd->objecter->read(soid.oid, oloc, op,
+				    cop->src.snap, NULL,
+				    flags,
+				    new C_OnFinisher(fin, &osd->objecter_finisher),
+				    // gather.new_sub(),
+				    // discover the object version if we don't know it yet
+				    cop->results.user_version ? NULL : &cop->results.user_version);
+    fin->tid = tid;
+    fin->offset = offset;
+    cop->objecter_tid = tid;
+  }
+#if 0
+    gather.set_finisher(new C_OnFinisher(fin,
+					 &osd->objecter_finisher));
+#endif
+#if 0
+  if (cop->results.user_version) {
+    op.assert_version(cop->results.user_version);
+  } else {
+    // we should learn the version after the first chunk, if we didn't know
+    // it already!
+    assert(cop->cursor.is_initial());
+  }
+#endif
+  //gather.activate();
 }
 
 void PrimaryLogPG::process_copy_chunk(hobject_t oid, ceph_tid_t tid, int r)
@@ -8437,6 +8642,192 @@ void PrimaryLogPG::process_copy_chunk(hobject_t oid, ceph_tid_t tid, int r)
   kick_object_context_blocked(cobc);
 }
 
+/* write temp oid first and then, rename ? */
+void PrimaryLogPG::process_copy_chunk_manifest(hobject_t oid, ceph_tid_t tid, int r, uint64_t offset)
+{
+  dout(0) << __func__ << " " << oid << " tid " << tid
+	   << " " << cpp_strerror(r) << " offset: " << offset << dendl;
+  map<hobject_t,CopyOpRef>::iterator p = copy_ops.find(oid);
+  if (p == copy_ops.end()) {
+    dout(10) << __func__ << " no copy_op found" << dendl;
+    return;
+  }
+  CopyOpRef ori_cop = p->second;
+  CopyOpRef cop = ori_cop->io_results[offset];
+
+  if (cop->omap_data.length() || cop->omap_header.length())
+    cop->results.has_omap = true;
+
+  if (r >= 0 && !pool.info.supports_omap() &&
+      (cop->omap_data.length() || cop->omap_header.length())) {
+    r = -EOPNOTSUPP;
+  }
+  cop->objecter_tid = 0;
+  cop->objecter_tid2 = 0;  // assume this ordered before us (if it happened)
+  ObjectContextRef& cobc = ori_cop->obc;
+
+  if (r < 0) {
+    ori_cop->failed = true;
+    goto out;
+  }
+
+  if (ori_cop->failed) {
+    return;
+  }
+
+  cop->results.ret = r;
+  ori_cop->num_chunk_result--;
+
+  assert(cop->rval >= 0);
+
+  if (oid.snap < CEPH_NOSNAP && !cop->results.snaps.empty()) {
+    // verify snap hasn't been deleted
+    vector<snapid_t>::iterator p = cop->results.snaps.begin();
+    while (p != cop->results.snaps.end()) {
+      if (pool.info.is_removed_snap(*p)) {
+	dout(10) << __func__ << " clone snap " << *p << " has been deleted"
+		 << dendl;
+	for (vector<snapid_t>::iterator q = p + 1;
+	     q != cop->results.snaps.end();
+	     ++q)
+	  *(q - 1) = *q;
+	cop->results.snaps.resize(cop->results.snaps.size() - 1);
+      } else {
+	++p;
+      }
+    }
+    if (cop->results.snaps.empty()) {
+      dout(10) << __func__ << " no more snaps for " << oid << dendl;
+      r = -ENOENT;
+      goto out;
+    }
+  }
+
+  assert(cop->rval >= 0);
+
+  if (!cop->temp_cursor.data_complete) {
+    cop->results.data_digest = cop->data.crc32c(cop->results.data_digest);
+  }
+  if (pool.info.supports_omap() && !cop->temp_cursor.omap_complete) {
+    if (cop->omap_header.length()) {
+      cop->results.omap_digest =
+	cop->omap_header.crc32c(cop->results.omap_digest);
+    }
+    if (cop->omap_data.length()) {
+      bufferlist keys;
+      keys.substr_of(cop->omap_data, 4, cop->omap_data.length() - 4);
+      cop->results.omap_digest = keys.crc32c(cop->results.omap_digest);
+    }
+  }
+
+  if (!cop->temp_cursor.attr_complete) {
+    for (map<string,bufferlist>::iterator p = cop->attrs.begin();
+	 p != cop->attrs.end();
+	 ++p) {
+      cop->results.attrs[string("_") + p->first] = p->second;
+    }
+    cop->attrs.clear();
+  }
+
+  if (cct->_conf->osd_debug_inject_copyfrom_error) {
+    derr << __func__ << " injecting copyfrom failure" << dendl;
+    r = -EIO;
+    goto out;
+  }
+  
+  /* only handle data ! (need to be fixed) */
+  if (cop->cursor.data_complete) {
+    ObjectContextRef obc = get_object_context(oid, true);
+    OpContextUPtr ctx = simple_opc_create(obc);
+    PGTransaction *t = ctx->op_t.get();
+    //cop->results.temp_oid = obs.oi.soid;
+    uint64_t length = obc->obs.oi.manifest.chunk_map[offset].length;
+    uint64_t wr_length = cop->data.length();
+    if (offset+length < offset+cop->cursor.data_offset+cop->data.length()) {
+      wr_length = (offset+cop->cursor.data_offset+cop->data.length()) - (offset+length);
+    }
+    dout(0) << " write offset: " << offset << " length: " << wr_length << dendl;
+    if (cop->data.length()) {
+      t->write(
+	oid,
+	offset + cop->cursor.data_offset,
+	wr_length,
+	cop->data,
+	cop->dest_obj_fadvise_flags);
+    }
+    cop->data.clear();
+    simple_opc_submit(std::move(ctx));
+  }
+
+  /* check all of the copyop are completed */
+  if (ori_cop->num_chunk_result) {
+    dout(0) << __func__ << " num_chunk_result: " << ori_cop->num_chunk_result << dendl;  
+    return; 
+  } 
+    
+
+  cop->results.fill_in_final_tx = std::function<void(PGTransaction*)>(
+    [this, &cop /* avoid ref cycle */](PGTransaction *t) {
+      ObjectState& obs = cop->obc->obs;
+      if (cop->temp_cursor.is_initial()) {
+	dout(0) << "fill_in_final_tx: writing "
+		 << "directly to final object" << dendl;
+	// write directly to final object
+	cop->results.temp_oid = obs.oi.soid;
+	_write_copy_chunk(cop, t);
+      } else {
+	// finish writing to temp object, then move into place
+	dout(20) << "fill_in_final_tx: writing to temp object" << dendl;
+	_write_copy_chunk(cop, t);
+	t->rename(obs.oi.soid, cop->results.temp_oid);
+      }
+      t->setattrs(obs.oi.soid, cop->results.attrs);
+    });
+
+  dout(20) << __func__ << " success; committing" << dendl;
+
+ out:
+  dout(0) << __func__ << " complete r = " << cpp_strerror(r) << dendl;
+  CopyCallbackResults results(r, &ori_cop->results);
+  cop->cb->complete(results);
+
+  copy_ops.erase(cobc->obs.oi.soid);
+  cobc->stop_block();
+
+  if (r < 0 && cop->results.started_temp_obj) {
+    dout(10) << __func__ << " deleting partial temp object "
+	     << cop->results.temp_oid << dendl;
+    ObjectContextRef tempobc = get_object_context(cop->results.temp_oid, true);
+    OpContextUPtr ctx = simple_opc_create(tempobc);
+    ctx->op_t->remove(cop->results.temp_oid);
+    ctx->discard_temp_oid = cop->results.temp_oid;
+    simple_opc_submit(std::move(ctx));
+  }
+
+  // cancel and requeue proxy ops on this object
+  if (!r) {
+    for (map<ceph_tid_t, ProxyReadOpRef>::iterator it = proxyread_ops.begin();
+	it != proxyread_ops.end();) {
+      if (it->second->soid == cobc->obs.oi.soid) {
+	cancel_proxy_read((it++)->second);
+      } else {
+	++it;
+      }
+    }
+    for (map<ceph_tid_t, ProxyWriteOpRef>::iterator it = proxywrite_ops.begin();
+	 it != proxywrite_ops.end();) {
+      if (it->second->soid == cobc->obs.oi.soid) {
+	cancel_proxy_write((it++)->second);
+      } else {
+	++it;
+      }
+    }
+    kick_proxy_ops_blocked(cobc->obs.oi.soid);
+  }
+
+  kick_object_context_blocked(cobc);
+}
+
 void PrimaryLogPG::_write_copy_chunk(CopyOpRef cop, PGTransaction *t)
 {
   dout(20) << __func__ << " " << cop
@@ -8448,6 +8839,69 @@ void PrimaryLogPG::_write_copy_chunk(CopyOpRef cop, PGTransaction *t)
   if (!cop->temp_cursor.attr_complete) {
     t->create(cop->results.temp_oid);
   }
+  if (!cop->temp_cursor.data_complete) {
+    assert(cop->data.length() + cop->temp_cursor.data_offset ==
+	   cop->cursor.data_offset);
+    if (pool.info.requires_aligned_append() &&
+	!cop->cursor.data_complete) {
+      /**
+       * Trim off the unaligned bit at the end, we'll adjust cursor.data_offset
+       * to pick it up on the next pass.
+       */
+      assert(cop->temp_cursor.data_offset %
+	     pool.info.required_alignment() == 0);
+      if (cop->data.length() % pool.info.required_alignment() != 0) {
+	uint64_t to_trim =
+	  cop->data.length() % pool.info.required_alignment();
+	bufferlist bl;
+	bl.substr_of(cop->data, 0, cop->data.length() - to_trim);
+	cop->data.swap(bl);
+	cop->cursor.data_offset -= to_trim;
+	assert(cop->data.length() + cop->temp_cursor.data_offset ==
+	       cop->cursor.data_offset);
+      }
+    }
+    if (cop->data.length()) {
+      t->write(
+	cop->results.temp_oid,
+	cop->temp_cursor.data_offset,
+	cop->data.length(),
+	cop->data,
+	cop->dest_obj_fadvise_flags);
+    }
+    cop->data.clear();
+  }
+  if (pool.info.supports_omap()) {
+    if (!cop->temp_cursor.omap_complete) {
+      if (cop->omap_header.length()) {
+	t->omap_setheader(
+	  cop->results.temp_oid,
+	  cop->omap_header);
+	cop->omap_header.clear();
+      }
+      if (cop->omap_data.length()) {
+	map<string,bufferlist> omap;
+	bufferlist::iterator p = cop->omap_data.begin();
+	::decode(omap, p);
+	t->omap_setkeys(cop->results.temp_oid, omap);
+	cop->omap_data.clear();
+      }
+    }
+  } else {
+    assert(cop->omap_header.length() == 0);
+    assert(cop->omap_data.length() == 0);
+  }
+  cop->temp_cursor = cop->cursor;
+}
+
+void PrimaryLogPG::_write_copy_chunk_manifest(CopyOpRef cop, PGTransaction *t)
+{
+  dout(0) << __func__ << " " << cop
+	   << " " << cop->attrs.size() << " attrs"
+	   << " " << cop->data.length() << " bytes"
+	   << " " << cop->omap_header.length() << " omap header bytes"
+	   << " " << cop->omap_data.length() << " omap data bytes"
+	   << dendl;
   if (!cop->temp_cursor.data_complete) {
     assert(cop->data.length() + cop->temp_cursor.data_offset ==
 	   cop->cursor.data_offset);
@@ -8740,6 +9194,215 @@ void PrimaryLogPG::finish_promote(int r, CopyResults *results,
       tctx->delta_stats.num_bytes += obc->ssc->snapset.get_clone_bytes(soid.snap);
     } else {
       tctx->delta_stats.num_bytes += results->object_size;
+    }
+  }
+
+  if (results->mirror_snapset) {
+    assert(tctx->new_obs.oi.soid.snap == CEPH_NOSNAP);
+    tctx->new_snapset.from_snap_set(
+      results->snapset,
+      get_osdmap()->require_osd_release < CEPH_RELEASE_LUMINOUS);
+  }
+  tctx->new_snapset.head_exists = true;
+  dout(20) << __func__ << " new_snapset " << tctx->new_snapset << dendl;
+
+  // take RWWRITE lock for duration of our local write.  ignore starvation.
+  if (!tctx->lock_manager.take_write_lock(
+	obc->obs.oi.soid,
+	obc)) {
+    assert(0 == "problem!");
+  }
+  dout(20) << __func__ << " took lock on obc, " << obc->rwstate << dendl;
+
+  finish_ctx(tctx.get(), pg_log_entry_t::PROMOTE);
+
+  simple_opc_submit(std::move(tctx));
+
+  osd->logger->inc(l_osd_tier_promote);
+
+  if (agent_state &&
+      agent_state->is_idle())
+    agent_choose_mode();
+}
+
+void PrimaryLogPG::finish_promote_manifest(int r, CopyResults *results,
+				  ObjectContextRef obc)
+{
+  const hobject_t& soid = obc->obs.oi.soid;
+  dout(0) << __func__ << " " << soid << " r=" << r
+	   << " uv" << results->user_version << dendl;
+
+  if (r == -ECANCELED) {
+    return;
+  }
+
+  if (r != -ENOENT && soid.is_snap()) {
+    if (results->snaps.empty()) {
+      // we must have read "snap" content from the head object in
+      // the base pool.  use snap_seq to construct what snaps should
+      // be for this clone (what is was before we evicted the clean
+      // clone from this pool, and what it will be when we flush and
+      // the clone eventually happens in the base pool).
+      SnapSet& snapset = obc->ssc->snapset;
+      vector<snapid_t>::iterator p = snapset.snaps.begin();
+      while (p != snapset.snaps.end() && *p > soid.snap)
+	++p;
+      while (p != snapset.snaps.end() && *p > results->snap_seq) {
+	results->snaps.push_back(*p);
+	++p;
+      }
+    }
+
+    dout(20) << __func__ << " snaps " << results->snaps << dendl;
+    filter_snapc(results->snaps);
+
+    dout(20) << __func__ << " filtered snaps " << results->snaps << dendl;
+    if (results->snaps.empty()) {
+      dout(20) << __func__
+	       << " snaps are empty, clone is invalid,"
+	       << " setting r to ENOENT" << dendl;
+      r = -ENOENT;
+    }
+  }
+
+  if (r < 0 && results->started_temp_obj) {
+    dout(10) << __func__ << " abort; will clean up partial work" << dendl;
+    ObjectContextRef tempobc = get_object_context(results->temp_oid, false);
+    assert(tempobc);
+    OpContextUPtr ctx = simple_opc_create(tempobc);
+    ctx->op_t->remove(results->temp_oid);
+    simple_opc_submit(std::move(ctx));
+    results->started_temp_obj = false;
+  }
+
+  if (r == -ENOENT && soid.is_snap()) {
+    dout(10) << __func__
+	     << ": enoent while trying to promote clone, " << soid
+	     << " must have been trimmed, removing from snapset"
+	     << dendl;
+    hobject_t head(soid.get_head());
+    ObjectContextRef obc = get_object_context(head, false);
+    assert(obc);
+
+    OpContextUPtr tctx = simple_opc_create(obc);
+    tctx->at_version = get_next_version();
+    filter_snapc(tctx->new_snapset.snaps);
+    vector<snapid_t> new_clones;
+    map<snapid_t, vector<snapid_t>> new_clone_snaps;
+    for (vector<snapid_t>::iterator i = tctx->new_snapset.clones.begin();
+	 i != tctx->new_snapset.clones.end();
+	 ++i) {
+      if (*i != soid.snap) {
+	new_clones.push_back(*i);
+	auto p = tctx->new_snapset.clone_snaps.find(*i);
+	if (p != tctx->new_snapset.clone_snaps.end()) {
+	  new_clone_snaps[*i] = p->second;
+	}
+      }
+    }
+    tctx->new_snapset.clones.swap(new_clones);
+    tctx->new_snapset.clone_overlap.erase(soid.snap);
+    tctx->new_snapset.clone_size.erase(soid.snap);
+    tctx->new_snapset.clone_snaps.swap(new_clone_snaps);
+
+    // take RWWRITE lock for duration of our local write.  ignore starvation.
+    if (!tctx->lock_manager.take_write_lock(
+	  head,
+	  obc)) {
+      assert(0 == "problem!");
+    }
+    dout(20) << __func__ << " took lock on obc, " << obc->rwstate << dendl;
+
+    finish_ctx(tctx.get(), pg_log_entry_t::PROMOTE);
+
+    simple_opc_submit(std::move(tctx));
+    return;
+  }
+
+  bool whiteout = false;
+  if (r == -ENOENT) {
+    assert(soid.snap == CEPH_NOSNAP); // snap case is above
+    dout(10) << __func__ << " whiteout " << soid << dendl;
+    whiteout = true;
+  }
+
+  if (r < 0 && !whiteout) {
+    derr << __func__ << " unexpected promote error " << cpp_strerror(r) << dendl;
+    // pass error to everyone blocked on this object
+    // FIXME: this is pretty sloppy, but at this point we got
+    // something unexpected and don't have many other options.
+    map<hobject_t,list<OpRequestRef>>::iterator blocked_iter =
+      waiting_for_blocked_object.find(soid);
+    if (blocked_iter != waiting_for_blocked_object.end()) {
+      while (!blocked_iter->second.empty()) {
+	osd->reply_op_error(blocked_iter->second.front(), r);
+	blocked_iter->second.pop_front();
+      }
+      waiting_for_blocked_object.erase(blocked_iter);
+    }
+    return;
+  }
+
+  osd->promote_finish(results->object_size);
+
+  OpContextUPtr tctx =  simple_opc_create(obc);
+  tctx->at_version = get_next_version();
+
+  if (soid.snap < CEPH_NOSNAP)
+    ++tctx->delta_stats.num_object_clones;
+
+  tctx->extra_reqids = results->reqids;
+
+  bool legacy_snapset = tctx->new_snapset.is_legacy() ||
+    get_osdmap()->require_osd_release < CEPH_RELEASE_LUMINOUS;
+
+  if (whiteout) {
+    // create a whiteout
+    tctx->op_t->create(soid);
+    tctx->new_obs.oi.set_flag(object_info_t::FLAG_WHITEOUT);
+    ++tctx->delta_stats.num_whiteouts;
+    dout(20) << __func__ << " creating whiteout on " << soid << dendl;
+    osd->logger->inc(l_osd_tier_whiteout);
+  } else {
+    if (results->has_omap) {
+      dout(10) << __func__ << " setting omap flag on " << soid << dendl;
+      tctx->new_obs.oi.set_flag(object_info_t::FLAG_OMAP);
+      ++tctx->delta_stats.num_objects_omap;
+    }
+    
+    uint64_t oi_size = 0;
+    for (auto& p : obc->obs.oi.manifest.chunk_map) {
+      oi_size += p.second.length;
+    }
+    tctx->new_obs.oi.size = oi_size;
+    tctx->new_obs.oi.user_version = results->user_version;
+#if 0
+    // Don't care src object whether have data or omap digest
+    if (results->object_size)
+      tctx->new_obs.oi.set_data_digest(results->data_digest);
+    if (results->has_omap)
+      tctx->new_obs.oi.set_omap_digest(results->omap_digest);
+    tctx->new_obs.oi.truncate_seq = results->truncate_seq;
+    tctx->new_obs.oi.truncate_size = results->truncate_size;
+#endif
+
+    if (soid.snap != CEPH_NOSNAP) {
+      if (legacy_snapset) {
+	tctx->new_obs.oi.legacy_snaps = results->snaps;
+	assert(!tctx->new_obs.oi.legacy_snaps.empty());
+      } else {
+	// it's already in the snapset
+	assert(obc->ssc->snapset.clone_snaps.count(soid.snap));
+      }
+      assert(obc->ssc->snapset.clone_size.count(soid.snap));
+      assert(obc->ssc->snapset.clone_size[soid.snap] ==
+	     results->object_size);
+      assert(obc->ssc->snapset.clone_overlap.count(soid.snap));
+
+      tctx->delta_stats.num_bytes += obc->ssc->snapset.get_clone_bytes(soid.snap);
+    } else {
+      //tctx->delta_stats.num_bytes += results->object_size;
+      tctx->delta_stats.num_bytes += oi_size;
     }
   }
 
@@ -9070,8 +9733,9 @@ int PrimaryLogPG::start_flush(
 int PrimaryLogPG::do_manifest_flush(OpRequestRef op, ObjectContextRef obc,
                                     SnapContext &snapc, FlushOpRef fop)
 {
-  const object_info_t& oi = obc->obs.oi;
-  const hobject_t& soid = oi.soid;
+  object_info_t& oi = obc->obs.oi;
+  hobject_t& soid = oi.soid;
+  object_manifest_t *manifest = &obc->obs.oi.manifest;
   ceph_tid_t tid;
   C_Flush *fin = new C_Flush(this, soid, get_last_peering_reset());
   C_GatherBuilder gather(g_ceph_context);
@@ -9105,8 +9769,27 @@ int PrimaryLogPG::do_manifest_flush(OpRequestRef op, ObjectContextRef obc,
 
     uint64_t s_offset = cursor;
     while (s_offset < cursor+read_ahead) {
-      uint64_t s_length = obc->obs.oi.manifest.chunk_map[s_offset].length;
-      hobject_t tgt_soid = obc->obs.oi.manifest.chunk_map[s_offset].oid;
+      uint64_t s_length;
+      hobject_t tgt_soid;
+      map<uint64_t, chunk_info_t>::iterator iter = oi.manifest.chunk_map.find(s_offset);
+      if (iter != oi.manifest.chunk_map.end()) {
+	s_length = oi.manifest.chunk_map[s_offset].length;
+      } else {
+	/* assume fixed length ! */
+	s_length = obc->obs.oi.manifest.chunk_map[0].length;
+	oi.manifest.chunk_map[s_offset].length = s_length; 	
+	oi.manifest.chunk_map[s_offset].flags = chunk_info_t::FLAG_DIRTY; 	
+      }
+      ChunknFPRef cnf(std::make_shared<ChunknFP>(FIXED_CHUNK, s_length, FP_SHA1));
+      bufferlist cnf_buf;
+      cnf_buf.append(chunks_data.c_str()+s_offset, s_length);
+      cnf->do_cnf(cnf_buf);
+
+      string oid_fp = cnf->get_fp_to_string(0);
+      oi.manifest.chunk_map[s_offset].oid = manifest->chunk_map[0].oid;
+      oi.manifest.chunk_map[s_offset].oid.oid = object_t(oid_fp);
+      tgt_soid = oi.manifest.chunk_map[s_offset].oid;
+
       object_locator_t oloc(tgt_soid);
       ObjectOperation obj_op;
       bufferlist write_buf;
@@ -9276,9 +9959,11 @@ int PrimaryLogPG::try_flush_mark_clean(FlushOpRef fop)
     }
   }
 
+  dout(0) << __func__ << " oid: " << obc->obs.oi.soid << dendl;
   // successfully flushed, can we evict this object?
   if (!fop->op && agent_state->evict_mode != TierAgentState::EVICT_MODE_IDLE &&
       agent_maybe_evict(obc, true)) {
+    dout(0) << __func__ << " oid: " << obc->obs.oi.soid << dendl;
     osd->logger->inc(l_osd_tier_clean);
     if (fop->on_flush) {
       (*(fop->on_flush))();
@@ -12985,7 +13670,7 @@ bool PrimaryLogPG::agent_work(int start_max, int agent_flush_quota)
 
   osd->logger->inc(l_osd_agent_wake);
 
-  dout(10) << __func__
+  dout(0) << __func__
 	   << " max " << start_max
 	   << ", flush " << agent_state->get_flush_mode_name()
 	   << ", evict " << agent_state->get_evict_mode_name()
@@ -13014,7 +13699,7 @@ bool PrimaryLogPG::agent_work(int start_max, int agent_flush_quota)
   int r = pgbackend->objects_list_partial(agent_state->position, ls_min, ls_max,
 					  &ls, &next);
   assert(r >= 0);
-  dout(20) << __func__ << " got " << ls.size() << " objects" << dendl;
+  dout(0) << __func__ << " got " << ls.size() << " objects" << dendl;
   int started = 0;
   for (vector<hobject_t>::iterator p = ls.begin();
        p != ls.end();
@@ -13047,7 +13732,7 @@ bool PrimaryLogPG::agent_work(int start_max, int agent_flush_quota)
       continue;
     }
     if (obc->obs.oi.has_manifest() && obc->obs.oi.size == 0) {
-      dout(20) << __func__ << " skip (manifest, already flushed) " << obc->obs.oi.soid << dendl;
+      dout(0) << __func__ << " skip (manifest, already flushed) " << obc->obs.oi.soid << dendl;
       continue;
     }
     if (scrubber.write_blocked_by_scrub(obc->obs.oi.soid)) {
@@ -13077,9 +13762,10 @@ bool PrimaryLogPG::agent_work(int start_max, int agent_flush_quota)
 #endif
 
     if (agent_state->evict_mode != TierAgentState::EVICT_MODE_IDLE &&
-	agent_maybe_evict(obc, false))
+	agent_maybe_evict(obc, false)) {
+      dout(0) << __func__ << " " << __LINE__ << dendl;
       ++started;
-    else if (agent_state->flush_mode != TierAgentState::FLUSH_MODE_IDLE &&
+    } else if (agent_state->flush_mode != TierAgentState::FLUSH_MODE_IDLE &&
              agent_flush_quota > 0 && agent_maybe_flush(obc)) {
       ++started;
       --agent_flush_quota;
@@ -13189,6 +13875,7 @@ void PrimaryLogPG::agent_load_hit_sets()
 
 bool PrimaryLogPG::agent_maybe_flush(ObjectContextRef& obc)
 {
+  dout(0) << __func__ << " flushing " << obc->obs.oi << dendl;
   if (!obc->obs.oi.is_dirty()) {
     dout(20) << __func__ << " skip (clean) " << obc->obs.oi << dendl;
     osd->logger->inc(l_osd_agent_skip);
@@ -13196,6 +13883,11 @@ bool PrimaryLogPG::agent_maybe_flush(ObjectContextRef& obc)
   }
   if (obc->obs.oi.is_cache_pinned()) {
     dout(20) << __func__ << " skip (cache_pinned) " << obc->obs.oi << dendl;
+    osd->logger->inc(l_osd_agent_skip);
+    return false;
+  }
+  if (obc->obs.oi.has_manifest() && obc->obs.oi.size == 0) {
+    dout(20) << __func__ << " skip (already flushed) " << obc->obs.oi << dendl;
     osd->logger->inc(l_osd_agent_skip);
     return false;
   }
@@ -13253,6 +13945,8 @@ bool PrimaryLogPG::agent_maybe_flush(ObjectContextRef& obc)
 bool PrimaryLogPG::agent_maybe_evict(ObjectContextRef& obc, bool after_flush)
 {
   const hobject_t& soid = obc->obs.oi.soid;
+  dout(0) << __func__ << " evicting testtest " << obc->obs.oi 
+	  << " num_dirty: " << info.stats.stats.sum.num_objects_dirty << dendl;
   if (!after_flush && obc->obs.oi.is_dirty()) {
     dout(20) << __func__ << " skip (dirty) " << obc->obs.oi << dendl;
     return false;
@@ -13267,6 +13961,10 @@ bool PrimaryLogPG::agent_maybe_evict(ObjectContextRef& obc, bool after_flush)
   }
   if (obc->obs.oi.is_cache_pinned()) {
     dout(20) << __func__ << " skip (cache_pinned) " << obc->obs.oi << dendl;
+    return false;
+  }
+  if (obc->obs.oi.has_manifest() && obc->obs.oi.size == 0) {
+    dout(20) << __func__ << " skip (already evicted) " << obc->obs.oi << dendl;
     return false;
   }
 
@@ -13319,6 +14017,7 @@ bool PrimaryLogPG::agent_maybe_evict(ObjectContextRef& obc, bool after_flush)
   }
 
   dout(10) << __func__ << " evicting " << obc->obs.oi << dendl;
+  dout(0) << __func__ << " evicting " << obc->obs.oi << dendl;
   OpContextUPtr ctx = simple_opc_create(obc);
 
   if (!ctx->lock_manager.get_lock_type(
@@ -13341,17 +14040,22 @@ bool PrimaryLogPG::agent_maybe_evict(ObjectContextRef& obc, bool after_flush)
   assert(ctx->new_obs.exists);
   if (obc->obs.oi.has_manifest()) {
     PGTransaction* t = ctx->op_t.get();
+    if (info.stats.stats.sum.num_objects_dirty == 0) {
+      assert(0);
+    }
     dout(0) << __func__ << " for chunked object " << dendl;
     t->truncate(soid, 0);
     ctx->delta_stats.num_bytes -= obc->obs.oi.size;
-    obc->obs.oi.size = 0;
-    obc->obs.oi.new_object();
+    ObjectState& obs = ctx->new_obs;
+    obs.oi.size = 0;
+    obs.oi.new_object();
 
     if (obc->obs.oi.is_omap())
       ctx->delta_stats.num_objects_omap--;
     ctx->delta_stats.num_evict++;
     ctx->delta_stats.num_evict_kb += SHIFT_ROUND_UP(obc->obs.oi.size, 10);
-    --ctx->delta_stats.num_objects_dirty;
+    if (obc->obs.oi.is_dirty())
+      --ctx->delta_stats.num_objects_dirty;
     finish_ctx(ctx.get(), pg_log_entry_t::MODIFY, false);
   } else {
   int r = _delete_oid(ctx.get(), true, false);
@@ -13460,7 +14164,7 @@ bool PrimaryLogPG::agent_choose_mode(bool restart, OpRequestRef op)
   }
 #endif
 
-  dout(10) << __func__
+  dout(0) << __func__
 	   << " flush_mode: "
 	   << TierAgentState::get_flush_mode_name(agent_state->flush_mode)
 	   << " evict_mode: "
@@ -13504,7 +14208,7 @@ bool PrimaryLogPG::agent_choose_mode(bool restart, OpRequestRef op)
       full_micro = full_objects_micro;
   }
 #endif
-  dout(20) << __func__ << " dirty " << ((float)dirty_micro / 1000000.0)
+  dout(0) << __func__ << " dirty " << ((float)dirty_micro / 1000000.0)
 	   << " full " << ((float)full_micro / 1000000.0)
 	   << dendl;
 
@@ -13525,6 +14229,8 @@ bool PrimaryLogPG::agent_choose_mode(bool restart, OpRequestRef op)
   } else if (dirty_micro > flush_target) {
     flush_mode = TierAgentState::FLUSH_MODE_LOW;
   }
+  dout(0) << __func__ << " dirty_micro: " << dirty_micro << " flush target: " << flush_target 
+	  << " flush mode: " << TierAgentState::get_flush_mode_name(flush_mode) << dendl;
 
   // evict mode
   uint64_t evict_target = pool.info.cache_target_full_ratio_micro;
@@ -13561,7 +14267,7 @@ bool PrimaryLogPG::agent_choose_mode(bool restart, OpRequestRef op)
   skip_calc:
   bool old_idle = agent_state->is_idle();
   if (flush_mode != agent_state->flush_mode) {
-    dout(5) << __func__ << " flush_mode "
+    dout(0) << __func__ << " flush_mode "
 	    << TierAgentState::get_flush_mode_name(agent_state->flush_mode)
 	    << " -> "
 	    << TierAgentState::get_flush_mode_name(flush_mode)

@@ -29,6 +29,7 @@ set(osd_srcs
   osd_types.cc
   ECUtil.cc
   ExtentCache.cc
+  Dedup.cc
   ${CMAKE_SOURCE_DIR}/src/common/TrackedOp.cc
   ${osd_cyg_functions_src}
   ${osdc_osd_srcs})
