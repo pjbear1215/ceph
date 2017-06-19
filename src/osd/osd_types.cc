@@ -4974,6 +4974,11 @@ void object_manifest_t::encode(bufferlist& bl) const
       break;
     case TYPE_CHUNKED:
       ::encode(chunk_map, bl);      
+      ::encode(ori_size, bl);      
+      ::encode(chunk_length, bl);      
+      break;
+    case TYPE_REFERENCE_COUNT:
+      ::encode(ref_cnt, bl);
       break;
     default:
       ceph_abort();
@@ -4992,6 +4997,11 @@ void object_manifest_t::decode(bufferlist::iterator& bl)
       break;
     case TYPE_CHUNKED:
       ::decode(chunk_map, bl);
+      ::decode(ori_size, bl);
+      ::decode(chunk_length, bl);
+      break;
+    case TYPE_REFERENCE_COUNT:
+      ::decode(ref_cnt, bl);
       break;
     default:
       ceph_abort();
@@ -5015,7 +5025,7 @@ void object_manifest_t::dump(Formatter *f) const
       f->close_section();
     }
     f->close_section();
-  }
+  } 
 }
 
 void object_manifest_t::generate_test_instances(list<object_manifest_t*>& o)
@@ -5031,6 +5041,10 @@ ostream& operator<<(ostream& out, const object_manifest_t& om)
     out << " " << om.redirect_target;
   } else if (om.is_chunked()) {
     out << " " << om.chunk_map;
+    out << " " << om.ori_size;
+    out << " " << om.chunk_length;
+  } else if (om.is_ref_cnt()) {
+    out << " " << om.ref_cnt;
   }
   out << ")";
   return out;

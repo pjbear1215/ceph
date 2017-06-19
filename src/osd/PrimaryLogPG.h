@@ -27,6 +27,7 @@
 #include "common/sharedptr_registry.hpp"
 #include "ReplicatedBackend.h"
 #include "PGTransaction.h"
+#include "osdc/Objecter.h"
 
 class CopyFromCallback;
 class PromoteCallback;
@@ -1384,8 +1385,24 @@ protected:
   void do_proxy_chunked_write(OpRequestRef op, ObjectContextRef obc, int op_index,
 			      uint64_t chunk_index, uint64_t req_offset, uint64_t req_length);
   bool can_proxy_chunked_read(OpRequestRef op);
+  bool can_proxy_chunked_write(OpRequestRef op);
   
+  ceph_tid_t do_dedup_write(string oid_fp, OpRequestRef op, ObjectContextRef obc, int op_index,
+			    uint64_t chunk_index, ObjectOperation * o_op, uint64_t real_offset, 
+			    uint64_t real_length);
+  void do_dedup_overwrite(OpRequestRef op, ObjectContextRef obc, int op_index, int chunk_index, 
+			  bufferlist &write_buf, uint64_t real_offset, uint64_t real_length);
+  bool do_dedup_full_read_and_write(OpRequestRef op, ObjectContextRef obc, int op_index,
+				    uint64_t chunk_index, uint64_t real_offset, uint64_t real_length);
+  void get_dedup_offset(uint64_t ori_offset, uint64_t ori_length,
+			uint64_t real_offset, uint64_t real_length,
+			uint64_t &d_offset, uint64_t &d_length,
+			uint64_t &s_offset);
+  void update_dedup_meta(ObjectContextRef obc);
+
   friend struct C_ProxyChunkRead;
+  friend struct C_DedupReadWrite;
+  friend struct C_DedupWrite_Commit;
 
 public:
   PrimaryLogPG(OSDService *o, OSDMapRef curmap,

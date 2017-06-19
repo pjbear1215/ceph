@@ -4445,10 +4445,14 @@ struct object_manifest_t {
     TYPE_NONE = 0,
     TYPE_REDIRECT = 1, 
     TYPE_CHUNKED = 2, 
+    TYPE_REFERENCE_COUNT = 3,
   };
   uint8_t type;  // redirect, chunked, ...
   hobject_t redirect_target;
   map <uint64_t, chunk_info_t> chunk_map;
+  uint64_t ori_size;
+  uint64_t chunk_length;
+  uint64_t ref_cnt;
 
   object_manifest_t() : type(0) { }
   object_manifest_t(uint8_t type, const hobject_t& redirect_target) 
@@ -4463,11 +4467,15 @@ struct object_manifest_t {
   bool is_chunked() const {
     return type == TYPE_CHUNKED;
   }
+  bool is_ref_cnt() const {
+    return type == TYPE_REFERENCE_COUNT;
+  }
   static const char *get_type_name(uint8_t m) {
     switch (m) {
     case TYPE_NONE: return "none";
     case TYPE_REDIRECT: return "redirect";
     case TYPE_CHUNKED: return "chunked";
+    case TYPE_REFERENCE_COUNT: return "ref_cnt";
     default: return "unknown";
     }
   }

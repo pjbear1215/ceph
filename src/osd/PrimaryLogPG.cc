@@ -2318,7 +2318,7 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_manifest_detail(
   }
 
   if (obc)
-    dout(10) << __func__ << " " << obc->obs.oi << " "
+    dout(0) << __func__ << " " << obc->obs.oi << " "
        << (obc->obs.exists ? "exists" : "DNE")
        << dendl;
 
@@ -2347,15 +2347,15 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_manifest_detail(
     }
     return cache_result_t::HANDLED_PROXY;
   case object_manifest_t::TYPE_CHUNKED:
+    if (can_proxy_chunked_read(op) || can_proxy_chunked_write(op)) {
+      do_proxy_chunked_op(op, obc->obs.oi.soid, obc, write_ordered);
+      return cache_result_t::HANDLED_PROXY;
+    }
     if (obc->obs.oi.size == 0) {
       const MOSDOp *m = static_cast<const MOSDOp*>(op->get_req());
       const object_locator_t oloc = m->get_object_locator();
       promote_object(obc, obc->obs.oi.soid, oloc, op, NULL);
       return cache_result_t::BLOCKED_PROMOTE;
-    }
-    if (can_proxy_chunked_read(op)) {
-      do_proxy_chunked_op(op, obc->obs.oi.soid, obc, write_ordered);
-      return cache_result_t::HANDLED_PROXY;
     }
     return cache_result_t::NOOP;
   default:
@@ -2756,10 +2756,10 @@ struct C_ProxyChunkRead : public Context {
 	if (!prdop->ops[op_index].outdata.length()) {
 	  bufferlist list;
 	  uint64_t len;
-	  if (obc->obs.oi.size >= offset+length) {
+	  if (obc->obs.oi.manifest.ori_size >= offset+length) {
 	    len = prdop->ops[op_index].op.extent.length;
 	  } else {
-	    len = obc->obs.oi.size - offset;
+	    len = obc->obs.oi.manifest.ori_size - offset;
 	  }
 	  bufferptr bptr(len);
 	  list.push_back(std::move(bptr));
@@ -2767,6 +2767,11 @@ struct C_ProxyChunkRead : public Context {
 	}
 	assert(obj_op);
 	uint64_t copy_offset;
+        lgeneric_dout(g_ceph_context, 0) << " Proxy chunk read fin "
+              << " tid: " << tid << " r: " << r << " req_offset: " << req_offset << " ori buf length: "
+              << prdop->ops[op_index].outdata.length() << " copy_offset: " << copy_offset
+              << " length: " << obj_op->ops[0].op.extent.length
+              << " out length: " << obj_op->ops[0].outdata.length() << dendl;
 	if (req_offset >= prdop->ops[op_index].op.extent.offset) {
 	  copy_offset = req_offset - prdop->ops[op_index].op.extent.offset;
 	} else {
@@ -2775,7 +2780,6 @@ struct C_ProxyChunkRead : public Context {
 	prdop->ops[op_index].outdata.copy_in(copy_offset, obj_op->ops[0].outdata.length(),
 					     obj_op->ops[0].outdata.c_str());
       } 	
-      
       pg->finish_proxy_read(oid, tid, r);
       pg->osd->logger->tinc(l_osd_tier_r_lat, ceph_clock_now() - start);
       if (obj_op) {
@@ -2785,6 +2789,61 @@ struct C_ProxyChunkRead : public Context {
     pg->unlock();
   }
 };
+
+struct C_DedupReadWrite : public Context {
+  PrimaryLogPGRef pg;
+  hobject_t oid;
+  epoch_t last_peering_reset;
+  ceph_tid_t tid;
+  PrimaryLogPG::ProxyReadOpRef prdop;
+  ObjectOperation *o_op;
+  utime_t start;
+  int next_op;
+  uint64_t real_offset;
+  uint64_t real_length;
+  int op_index;
+  uint64_t chunk_index;
+  ObjectContextRef obc;
+  C_DedupReadWrite(PrimaryLogPG *p, hobject_t o, epoch_t lpr,
+             const PrimaryLogPG::ProxyReadOpRef& prd)
+    : pg(p), oid(o), last_peering_reset(lpr),
+      tid(0), prdop(prd), start(ceph_clock_now()), next_op(0),
+      real_offset(0), real_length(0)
+  {}
+  void finish(int r) {
+    assert(o_op);
+    assert(real_length);
+
+    pg->lock();
+    if (prdop->canceled) {
+      pg->unlock();
+      return;
+    }
+    do_dedup_overwrite_from_read(r);
+
+    if (o_op) {
+      delete o_op;
+    }
+    pg->unlock();
+  }
+
+  void do_dedup_overwrite_from_read(int r) {
+      int r_index = 0;
+      assert(o_op);
+      if (!o_op->ops.size()) {
+	assert(0);
+      }
+      lgeneric_dout(g_ceph_context, 0) << __func__ << " oid: " << oid << " tid: " << tid
+                      << " data lengh: " << o_op->ops[r_index].outdata.length()
+                      << " result: " << r <<  "real_offset: " << real_offset
+		      << " resl_lenght: " << real_length << dendl;
+      pg->do_dedup_overwrite(prdop->op, obc, op_index, chunk_index, o_op->ops[r_index].outdata,
+			     real_offset, real_length);
+
+      pg->finish_proxy_read(oid, tid, r);
+  }
+};
+
 
 void PrimaryLogPG::do_proxy_read(OpRequestRef op, ObjectContextRef obc)
 {
@@ -2998,6 +3057,54 @@ struct C_ProxyWrite_Commit : public Context {
   }
 };
 
+struct C_DedupWrite_Commit : public Context {
+  PrimaryLogPGRef pg;
+  hobject_t oid; // ori oid
+  epoch_t last_peering_reset;
+  ceph_tid_t tid;
+  PrimaryLogPG::ProxyWriteOpRef pwop;
+  string oid_fp;
+  int mode;
+  uint64_t real_offset;
+  uint64_t real_length;
+  ObjectOperation *o_op;
+  ObjectContextRef obc;
+  C_DedupWrite_Commit(PrimaryLogPG *p, hobject_t o, epoch_t lpr,
+                      const PrimaryLogPG::ProxyWriteOpRef& pw)
+    : pg(p), oid(o), last_peering_reset(lpr),
+      tid(0), pwop(pw), mode(0), real_offset(0),
+      real_length(0), o_op(NULL)
+  { }
+  void finish(int r) {
+    lgeneric_dout(g_ceph_context, 0) << __func__ << " " << __LINE__ << " C_DedupWrite_Commit oid: " << oid
+                    << " tid: " << tid << " r: " << r << dendl;
+    pg->lock();
+    if (pwop->canceled) {
+      pg->unlock();
+      return;
+    }
+    
+    if (last_peering_reset == pg->get_last_peering_reset()) {
+      pg->finish_proxy_write(oid, tid, r);
+    }
+    
+    pg->update_dedup_meta(obc);
+    pg->unlock();
+    if (o_op) {
+      delete o_op;
+    }
+  }
+};
+
+void PrimaryLogPG::update_dedup_meta(ObjectContextRef obc) {
+  OpContextUPtr ctx = simple_opc_create(obc);
+  ctx->at_version = get_next_version();
+  utime_t now = ceph_clock_now();
+  ctx->mtime = now;
+  finish_ctx(ctx.get(), pg_log_entry_t::MODIFY);
+  simple_opc_submit(std::move(ctx));
+}
+
 void PrimaryLogPG::do_proxy_write(OpRequestRef op, const hobject_t& missing_oid, ObjectContextRef obc)
 {
   // NOTE: non-const because ProxyWriteOp takes a mutable ref
@@ -3060,28 +3167,338 @@ void PrimaryLogPG::do_proxy_chunked_op(OpRequestRef op, const hobject_t& missing
     uint64_t chunk_length = 0, chunk_index = 0, padding;
     object_manifest_t *manifest = &obc->obs.oi.manifest;
 
-    while (cursor < op_length) {
-      for (map<uint64_t, chunk_info_t>::iterator i = manifest->chunk_map.begin();
-	   i != manifest->chunk_map.end();
-	   ++i) {
-	if (i->first <= cursor && i->first + i->second.length > cursor) {
-	  chunk_length = i->second.length;
-	  chunk_index = i->first;
+    if (op->may_read()) {
+      while (cursor < op_length) {
+	chunk_index = 0;
+	chunk_length = 0;
+	for (map<uint64_t, chunk_info_t>::iterator i = manifest->chunk_map.begin();
+	     i != manifest->chunk_map.end();
+	     ++i) {
+	  if (i->first <= cursor && i->first + i->second.length > cursor) {
+	    chunk_length = i->second.length;
+	    chunk_index = i->first;
+	  } 
+	}
+	dout(0) << __func__ << " chunk_index: " << chunk_index << " chunk_length: " << chunk_length << dendl;
+	if (!chunk_index && !chunk_length) {
+	  break;
+	}
+	/* read */
+#if 0
+	padding = cursor % chunk_length;
+	padding = chunk_length - padding;
+#endif
+	uint64_t next_length =  chunk_length;
+	if (cursor + next_length > op_length) {
+	  next_length = op_length - cursor;
+	}
+	do_proxy_chunked_read(op, obc, i, chunk_index, cursor, next_length);
+	cursor += next_length;
+      }
+    } else if (op->may_write()) {
+      /* write (only for fiexd chunk)*/
+      uint64_t chunked_offset, chunked_length, padding;
+      uint64_t length = osd_op->op.extent.length;
+      bool no_index = false;
+
+      chunk_length = obc->obs.oi.manifest.chunk_length;
+      /* | padding | data | */
+      padding = cursor % chunk_length;
+      chunked_offset = cursor - padding;
+
+      /* | data | padding | */
+      padding = (cursor + length) % chunk_length;
+      if (padding) {
+	padding = chunk_length - padding;
+      }
+      chunked_length = (cursor + length + padding) - chunked_offset;
+
+      map<uint64_t, chunk_info_t>::iterator iter = manifest->chunk_map.find(chunked_offset);
+      /* no index */
+      if (iter == manifest->chunk_map.end()) {
+	manifest->chunk_map[cursor].length = manifest->chunk_map[0].length;
+	chunk_length = obc->obs.oi.manifest.chunk_map[0].length;
+	no_index = true;
+      } 
+      dout(0) << __func__ << " chunked_offset: " << chunked_offset << " chunked_length: " << chunked_length
+	      << " no_index?: " << no_index << dendl;
+
+      /* aligned write for dedup */
+      for (uint64_t t_cursor = chunked_offset; t_cursor < (chunked_offset+chunked_length);
+	   t_cursor += chunk_length) {
+	//uint64_t buf_offset, buf_length, s_offset;
+	dout(0) << __func__ << " t_cursor: " << t_cursor << " chunk_length: " << chunk_length
+		<< dendl;
+	map<uint64_t, chunk_info_t>::iterator iter = manifest->chunk_map.find(t_cursor);
+	/* no index */
+	if (iter == manifest->chunk_map.end()) {
+	  no_index = true;
+	} 
+	/* | data | = | data 	       |
+		      | chunk_length   |	   
+	   | data | = | data | no data | */
+	if (no_index || ( (t_cursor >= cursor) &&   
+			(t_cursor+chunk_length <= obc->obs.oi.manifest.ori_size ))) {
+	  bufferptr tmp_buf(chunk_length);
+	  tmp_buf.zero();
+	  bufferlist write_buf;
+	  write_buf.append(tmp_buf);
+#if 0
+	  get_dedup_offset(cursor, length, t_cursor, chunk_length,
+			   buf_offset, buf_length, s_offset);
+	  dout(0) << __func__ << " buf_offset: " << buf_offset << " buf_length: " << buf_length
+		  << " s_offset: " << s_offset << dendl;
+	  write_buf.copy_in(buf_offset, buf_length, osd_op->indata.c_str() + s_offset);
+#endif
+	  do_dedup_overwrite(op, obc, i, t_cursor, 
+			     write_buf, t_cursor, chunk_length);
 	} else {
-	  /* no index */
-	  chunk_index = cursor; 
+	  map<uint64_t, chunk_info_t>::iterator iter = manifest->chunk_map.find(chunked_offset);
+	  if (iter == manifest->chunk_map.end()) {
+	    assert(0);
+	  }
+	  do_dedup_full_read_and_write(op, obc, i, t_cursor, t_cursor, chunk_length);
 	}
       }
-      padding = cursor % chunk_length;
-      padding = chunk_length - padding;
-      uint64_t next_length =  padding;
-      if (cursor + next_length > op_length) {
-	next_length = op_length - cursor;
-      }
-      do_proxy_chunked_read(op, obc, i, chunk_index, cursor, next_length);
-      cursor += chunk_length;
+    } else {
+      assert(0);
     }
   } 
+}
+
+/*
+ * ori_* : requested offset, length
+ * real_* : dedup offset, length (chunk boundary)
+ * d_offset : destination offset (chunk length buffer)
+ * d_length : destination length
+ * s_offset : source offset
+ *
+ */
+void PrimaryLogPG::get_dedup_offset(uint64_t ori_offset, uint64_t ori_length,
+                                    uint64_t real_offset, uint64_t real_length,
+                                    uint64_t &d_offset, uint64_t &d_length,
+                                    uint64_t &s_offset)
+{
+  d_offset = 0;
+  d_length = 0;
+  s_offset = 0;
+
+  if (ori_offset > real_offset) {
+    d_offset = ori_offset - real_offset;
+  }
+  /* | aligned data | or chunk size is less than length */
+  d_length = real_length;
+  /* | partial data | padding | */
+  if (ori_offset <= real_offset) {
+    if (real_offset + real_length > ori_offset + ori_length) {
+      d_length = (ori_offset + ori_length) - real_offset;
+      /* | padding | partial data | padding | */
+      if (d_offset > 0) {
+        d_length = d_length - d_offset;
+      }
+    }
+  /* | padding | partial data | */
+  } else if (ori_offset > real_offset) {
+    /* | padding | partial data | or | padding | partial data | padding | */
+    if (real_offset + real_length < (ori_offset + real_length)) {
+      d_length = ori_length;
+      /* | padding | partial data | partial data --> | padding | partial data | */
+      if (d_offset + d_length > real_length) {
+        d_length = real_length - d_offset;
+      }
+    }
+  }
+  if (real_offset > ori_offset) {
+    s_offset = real_offset - ori_offset;
+  }
+}
+
+bool PrimaryLogPG::do_dedup_full_read_and_write(OpRequestRef op, ObjectContextRef obc, int op_index,
+                                                uint64_t chunk_index, uint64_t real_offset, uint64_t real_length)
+{
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_nonconst_req());
+  object_manifest_t *manifest = &obc->obs.oi.manifest;
+  hobject_t soid = manifest->chunk_map[chunk_index].oid;
+  hobject_t ori_soid = m->get_hobj();
+  object_locator_t oloc(soid);
+
+  unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY;
+  flags |= m->get_flags() & (CEPH_OSD_FLAG_RWORDERED);
+
+  dout(0) << __func__ << " " << __LINE__ 
+          << " chunk_index: " << chunk_index
+          << " real_offset: " << real_offset
+          << " real_length: " << real_length << dendl;
+
+  ProxyReadOpRef prdop(std::make_shared<ProxyReadOp>(op, ori_soid, m->ops));
+
+  ObjectOperation *o_op = new ObjectOperation;
+  assert(o_op);
+  OSDOp &osd_op = o_op->add_op(CEPH_OSD_OP_READ);
+  osd_op.op.extent.offset = 0;
+  osd_op.op.extent.length = real_length;
+
+  C_DedupReadWrite *fin = new C_DedupReadWrite(this, ori_soid, get_last_peering_reset(),
+                                     prdop);
+  fin->real_offset = real_offset;
+  fin->real_length = real_length;
+  fin->o_op = o_op;
+  fin->op_index = op_index;
+  fin->chunk_index = chunk_index;
+  fin->obc = obc;
+
+  ObjectOperation obj_op;
+  obj_op.dup(o_op->ops);
+
+  ceph_tid_t tid = osd->objecter->read(
+    soid.oid, oloc, obj_op,
+    m->get_snapid(), NULL,
+    flags, new C_OnFinisher(fin, &osd->objecter_finisher),
+    &prdop->user_version,
+    &prdop->data_offset,
+    m->get_features());
+
+  fin->tid = tid;
+
+  prdop->objecter_tid = tid;
+  proxyread_ops[tid] = prdop;
+  in_progress_proxy_ops[ori_soid].push_back(op);
+
+  dout(15) << __func__ << " " << __LINE__ << " fp oid: " << soid.oid.name
+          << " ori oid: " << m->get_oid() << " tid: " << tid << " ops size: "
+          << o_op->ops.size() << dendl;
+
+  return true;
+}
+
+void PrimaryLogPG::do_dedup_overwrite(OpRequestRef op, ObjectContextRef obc, int op_index, int chunk_index, 
+				      bufferlist &buf, uint64_t real_offset, uint64_t real_length)
+{
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_nonconst_req());
+  assert(m);
+  bufferlist list;
+  /* find original write ops */
+  int w_index = op_index;
+  uint64_t chunk_length = obc->obs.oi.manifest.chunk_length;
+  string oid_fp;
+
+  ChunknFPRef cnf(std::make_shared<ChunknFP>(FIXED_CHUNK, chunk_length, FP_SHA1));
+  uint64_t t_offset = 0, t_length = 0, s_offset = 0;
+  uint64_t ori_offset = m->ops[w_index].op.extent.offset;
+  uint64_t ori_length = m->ops[w_index].op.extent.length;
+
+  get_dedup_offset(ori_offset, ori_length, real_offset, real_length,
+                    t_offset, t_length, s_offset);
+
+  dout(0) << __func__ << " " << __LINE__ << " ori_offset: " << ori_offset
+          << " ori_length: " << ori_length << " t_offset: " << t_offset << " t_length: "
+          << t_length << " s_offset: " << s_offset  << " real_offset: " << real_offset
+          << " real_length: " << real_length << dendl;
+  
+  bufferlist write_buf;
+
+  if (buf.length() == chunk_length) {
+    write_buf = buf;
+  } else {
+    bufferptr tmp_buf(chunk_length);
+    tmp_buf.zero();
+    write_buf.append(tmp_buf);
+  }
+
+  write_buf.copy_in(t_offset, t_length, m->ops[w_index].indata.c_str() + s_offset);
+  cnf->do_cnf(write_buf);
+  oid_fp = cnf->get_fp_to_string(0);
+
+  ObjectOperation * obj_op = new ObjectOperation;
+  assert(obj_op);
+  OSDOp &osd_op = obj_op->add_op(CEPH_OSD_OP_WRITE);
+#if 0
+  if (real_offset >= ori_offset) {
+    osd_op.op.extent.offset = 0;
+  } else {
+    osd_op.op.extent.offset = ori_offset % chunk_length;
+  }
+  if (real_offset + real_length < ori_offset + ori_length) {
+    osd_op.op.extent.length = write_buf.length();
+  } else {
+    osd_op.op.extent.length = (ori_offset+ori_length) - real_offset;
+  }
+#endif
+  osd_op.op.extent.offset = 0;
+  osd_op.op.extent.length = write_buf.length();
+  osd_op.indata.append(write_buf);
+
+  /* real_offset is chunk_index ! */
+  obc->obs.oi.manifest.chunk_map[chunk_index].oid = obc->obs.oi.manifest.chunk_map[0].oid;
+  obc->obs.oi.manifest.chunk_map[chunk_index].oid.oid = object_t(oid_fp);
+
+  do_dedup_write(oid_fp, op, obc, op_index, chunk_index, obj_op, real_offset, real_length);
+  dout(0) << __func__ << " " << __LINE__ << " oid_fp: " << oid_fp << " extent.offset: "
+          << m->ops[w_index].op.extent.offset
+          << " extent.length: " << m->ops[w_index].op.extent.length << " data length: "
+          << m->ops[w_index].indata.length()
+          << " write buf size: " << write_buf.length() << " real_offset: " << real_offset
+          << " real_length: " << real_length
+          << dendl;
+  write_buf.clear();
+
+}
+
+ceph_tid_t PrimaryLogPG::do_dedup_write(string oid_fp, OpRequestRef op, ObjectContextRef obc, int op_index,
+					uint64_t chunk_index, ObjectOperation * o_op, uint64_t real_offset, 
+					uint64_t real_length)
+{
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_nonconst_req());
+  SnapContext snapc(m->get_snap_seq(), m->get_snaps());
+  object_t oid(oid_fp);
+  assert(o_op);
+  assert(o_op->ops.size());
+
+  hobject_t ori_soid = obc->obs.oi.soid;
+  hobject_t tgt_soid = obc->obs.oi.manifest.chunk_map[chunk_index].oid;
+  object_locator_t cas_oloc(tgt_soid);
+
+  unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY | CEPH_OSD_FLAG_RWORDERED;
+
+  osd_reqid_t reqid = m->get_reqid();
+  //reqid.name = entity_name_t(reqid.name._type, real_offset);
+  reqid.inc = reqid.inc + real_offset + 1;
+  ProxyWriteOpRef pwop(std::make_shared<ProxyWriteOp>(op, ori_soid, m->ops, reqid));
+  pwop->ctx = new OpContext(op, m->get_reqid(), pwop->ops, this);
+  pwop->mtime = m->get_mtime();
+
+  /* obj_op will be deleted... */
+  ObjectOperation obj_op;
+  obj_op.dup(o_op->ops);
+
+  C_DedupWrite_Commit *fin = new C_DedupWrite_Commit(
+      this, ori_soid, get_last_peering_reset(), pwop);
+  fin->oid_fp = oid_fp;
+  fin->real_offset = real_offset;
+  fin->real_length = real_length;
+  fin->o_op = o_op;
+  fin->obc = obc;
+
+  C_GatherBuilder gather(g_ceph_context);
+  gather.set_finisher(new C_OnFinisher(fin,
+                                       &osd->objecter_finisher));
+
+  ceph_tid_t tid;
+  tid = osd->objecter->mutate(
+    tgt_soid.oid, cas_oloc, obj_op, snapc,
+    ceph::real_clock::from_ceph_timespec(pwop->mtime),
+    flags, gather.new_sub(),
+    &pwop->user_version, pwop->reqid);
+
+  fin->tid = tid;
+  pwop->objecter_tid = tid;
+  proxywrite_ops[tid] = pwop;
+  in_progress_proxy_ops[ori_soid].push_back(op);
+  dout(0) << __func__ << " " << __LINE__ << " fp oid: " << oid_fp
+          << " ori oid: " << m->get_oid() << " tid: " << tid
+          << dendl;
+  gather.activate();
+  return tid;
 }
 
 void PrimaryLogPG::do_proxy_chunked_write(OpRequestRef op, ObjectContextRef obc, int op_index,
@@ -3155,13 +3572,12 @@ void PrimaryLogPG::do_proxy_chunked_read(OpRequestRef op, ObjectContextRef obc, 
   if (!manifest->chunk_map.count(chunk_index)) {
     return;
   } 
-  uint64_t chunk_length = manifest->chunk_map[chunk_index].length;
   hobject_t soid = manifest->chunk_map[chunk_index].oid;
   hobject_t ori_soid = m->get_hobj();
   object_locator_t oloc(soid);
   unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY;
   
-  if (!chunk_length || soid == hobject_t()) {
+  if (soid == hobject_t()) {
     return;
   }
 
@@ -3171,7 +3587,7 @@ void PrimaryLogPG::do_proxy_chunked_read(OpRequestRef op, ObjectContextRef obc, 
 			     CEPH_OSD_FLAG_ENFORCE_SNAPC |
 			     CEPH_OSD_FLAG_MAP_SNAP_CLONE);
 
-  dout(10) << __func__ << " Start do chunk proxy read for " << *m 
+  dout(0) << __func__ << " Start do chunk proxy read for " << *m 
 	   << " index: " << op_index << " oid: " << soid.oid.name << " req_offset: " << req_offset 
 	   << " req_length: " << req_length << dendl;
 
@@ -3181,7 +3597,7 @@ void PrimaryLogPG::do_proxy_chunked_read(OpRequestRef op, ObjectContextRef obc, 
   OSDOp &osd_op = pobj_op->add_op(m->ops[op_index].op.op);
 
   if (soid.oid.name != ori_soid.oid.name) {
-    osd_op.op.extent.offset = req_offset % chunk_length;
+    osd_op.op.extent.offset = chunk_index - req_offset;
     osd_op.op.extent.length = req_length; 
   } else {
     osd_op.op.extent.offset = req_offset;
@@ -3223,7 +3639,26 @@ bool PrimaryLogPG::can_proxy_chunked_read(OpRequestRef op)
       case CEPH_OSD_OP_READ: 
       case CEPH_OSD_OP_SYNC_READ:
       case CEPH_OSD_OP_SPARSE_READ:
-	break;
+	continue;
+      default:
+	return false;
+    }
+  }
+  return ret;
+}
+
+bool PrimaryLogPG::can_proxy_chunked_write(OpRequestRef op)
+{
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_nonconst_req());
+  OSDOp *osd_op = NULL;
+  bool ret = true;
+  for (unsigned int i = 0; i < m->ops.size(); i++) {
+    osd_op = &m->ops[i];
+    ceph_osd_op op = osd_op->op;
+    switch (op.op) {
+      case CEPH_OSD_OP_WRITE: 
+      case CEPH_OSD_OP_WRITEFULL:
+	continue;
       default:
 	return false;
     }
@@ -6343,6 +6778,8 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	}
 
 	uint64_t cursor = 0;
+	oi.manifest.ori_size = oi.size;
+	oi.manifest.chunk_length = chunk_length;
 	do {
 	  pg_t raw_pg;
 	  string chunk_name = soid.oid.name;
@@ -6351,13 +6788,16 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 			   raw_pg.ps(), raw_pg.pool(),
 			   target_oloc.nspace);
 	  chunk_info_t chunk_info;
-	  chunk_info.length = chunk_length;
 	  chunk_info.oid = target;
 	  chunk_info.flags = chunk_info_t::FLAG_DIRTY;
+	  if (cursor + chunk_length > oi.size) {
+	    chunk_length = oi.size - cursor;
+	  }
+	  chunk_info.length = chunk_length;
 	  oi.manifest.chunk_map[cursor] = chunk_info;
 	  cursor += chunk_length;
 	} while (cursor < oi.size);
-
+	
 	oi.set_flag(object_info_t::FLAG_MANIFEST);
 	oi.manifest.type = object_manifest_t::TYPE_CHUNKED;
 	ctx->modify = true;
@@ -9741,7 +10181,7 @@ int PrimaryLogPG::do_manifest_flush(OpRequestRef op, ObjectContextRef obc,
   C_GatherBuilder gather(g_ceph_context);
   gather.set_finisher(new C_OnFinisher(fin,
 				       &osd->objecter_finisher));
-  uint64_t cursor = 0, read_ahead = 0;
+  uint64_t cursor = 0, read_ahead = 0, chunk_length = obc->obs.oi.manifest.chunk_length;
 
   while (cursor < oi.size) {
     dout(0) << __func__ << " " << " cursor: " << cursor << dendl;
@@ -9758,6 +10198,7 @@ int PrimaryLogPG::do_manifest_flush(OpRequestRef op, ObjectContextRef obc,
       }
     }
 
+    dout(0) << __func__ << " read_ahead: " << read_ahead << dendl;
     bufferlist chunks_data;
     int r = pgbackend->objects_read_sync(
 	soid, cursor, read_ahead, 0, &chunks_data);
@@ -9765,6 +10206,10 @@ int PrimaryLogPG::do_manifest_flush(OpRequestRef op, ObjectContextRef obc,
       dout(0) << __func__ << " read fail " << " offset: " << cursor
 	      << " read_ahead: " << read_ahead << " r: " << r << dendl;
       return r;
+    }
+
+    if (!chunks_data.length()) {
+      assert(0);
     }
 
     uint64_t s_offset = cursor;
@@ -9780,9 +10225,14 @@ int PrimaryLogPG::do_manifest_flush(OpRequestRef op, ObjectContextRef obc,
 	oi.manifest.chunk_map[s_offset].length = s_length; 	
 	oi.manifest.chunk_map[s_offset].flags = chunk_info_t::FLAG_DIRTY; 	
       }
-      ChunknFPRef cnf(std::make_shared<ChunknFP>(FIXED_CHUNK, s_length, FP_SHA1));
+      dout(0) << __func__ << " s_length: " << s_length << " s_offset: " << s_offset 
+	      << " chunk_length: " << chunk_length << dendl;
+      ChunknFPRef cnf(std::make_shared<ChunknFP>(FIXED_CHUNK, chunk_length, FP_SHA1));
+      bufferptr tmp_chunk_buf(chunk_length);
+      tmp_chunk_buf.zero();
       bufferlist cnf_buf;
-      cnf_buf.append(chunks_data.c_str()+s_offset, s_length);
+      cnf_buf.append(tmp_chunk_buf);
+      cnf_buf.copy_in(0, s_length, chunks_data.c_str()+s_offset);
       cnf->do_cnf(cnf_buf);
 
       string oid_fp = cnf->get_fp_to_string(0);
