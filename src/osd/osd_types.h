@@ -4423,6 +4423,7 @@ static inline ostream& operator<<(ostream& out, const notify_info_t& n) {
 struct chunk_info_t {
   enum {
     FLAG_DIRTY = 1, 
+    FLAG_MISSING = 2,
   };
   uint64_t length;
   hobject_t oid;
@@ -4434,6 +4435,9 @@ struct chunk_info_t {
     string r;
     if (flags & FLAG_DIRTY) {
       r += "|dirty";
+    }
+    if (flags & FLAG_DIRTY) {
+      r += "|missing";
     }
     if (r.length())
       return r.substr(1);

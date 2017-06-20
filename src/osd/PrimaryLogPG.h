@@ -235,6 +235,18 @@ public:
   };
   typedef ceph::shared_ptr<FlushOp> FlushOpRef;
 
+  struct ManifestFlushOp {
+    ObjectContextRef obc;
+    OpRequestRef op; 
+    map<uint64_t, int> io_results;
+    uint64_t chunks;
+    bool fail;
+
+    ManifestFlushOp()
+      : chunks(0), fail(false) {}
+  };
+  typedef ceph::shared_ptr<ManifestFlushOp> ManifestFlushOpRef;
+
   boost::scoped_ptr<PGBackend> pgbackend;
   PGBackend *get_pgbackend() override {
     return pgbackend.get();
@@ -1364,8 +1376,11 @@ protected:
   void do_proxy_chunked_write(OpRequestRef op, ObjectContextRef obc, int op_index,
 			      uint64_t chunk_index, uint64_t req_offset, uint64_t req_length);
   bool can_proxy_chunked_read(OpRequestRef op);
+  int  do_manifest_flush(OpRequestRef op, ObjectState &obs, bool block);
+  void finish_manifest_flush(hobject_t oid, int r, bool blocking);
   
   friend struct C_ProxyChunkRead;
+  friend struct C_ManifestFlush;
 
 public:
   PrimaryLogPG(OSDService *o, OSDMapRef curmap,
