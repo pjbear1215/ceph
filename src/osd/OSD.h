@@ -364,6 +364,100 @@ struct PGRecovery {
   }
 };
 
+class OpQueueItem {
+public:
+  class OrderLocker {
+  public:
+    using Ref = unique_ptr<OrderLocker>;
+    virtual void lock_suspend_timeout(ThreadPool::TPHandle &handle) = 0;
+    virtual void unlock() = 0;
+    virtual ~OrderLocker() {}
+  };
+  // Abstraction for operations queueable in the op queue
+  class PGQueueable {
+  public:
+    using Ref = std::unique_ptr<OpQueueable>;
+    
+    /// Items with the same queue token will end up in the same shard
+    virtual uint32_t get_queue_token() const = 0;
+    
+    /* Items will be dequeued and locked atomically w.r.t. other items with the
+       * same ordering token */
+    virtual void *get_ordering_token() const = 0;
+    virtual OrderLocker::Ref get_order_locker() = 0;
+    
+    virtual boost::optional<OpRequestRef> maybe_get_op() const {
+      return boost::none;
+    }
+    
+    virtual uint64_t get_reserved_pushes() const {
+      return 0;
+    }
+    
+    virtual ostream &print(ostream &rhs) const = 0;
+    
+    virtual void run(OSD *osd, ThreadPool::TPHandle &handle) = 0;
+    virtual ~OpQueueable() {}
+  };
+
+private:
+  OpQueueable::Ref qitem;
+  int cost;
+  unsigned priority;
+  utime_t start_time;
+  entity_inst_t owner;
+
+public:
+  OpQueueItem(
+    OpQueueable::Ref &&item,
+    int cost,
+    unsigned priority,
+    utime_t start_time,
+    const entity_inst_t &owner)
+    : qitem(std::move(item)),
+      cost(cost),
+      priority(priority),
+      start_time(start_time),
+      owner(owner) {}
+  OpQueueItem(OpQueueItem &&) = default;
+  OpQueueItem(const OpQueueItem &) = delete;
+  OpQueueItem &operator=(OpQueueItem &&) = default;
+  OpQueueItem &operator=(const OpQueueItem &) = delete;
+
+  OrderLocker::Ref get_order_locker() {
+    assert(qitem);
+    return qitem->get_order_locker();
+  }
+
+  uint32_t get_queue_token() const {
+    assert(qitem);
+    return qitem->get_queue_token();
+  }
+  void *get_ordering_token() const {
+    assert(qitem);
+    return qitem->get_ordering_token();
+  }
+
+  boost::optional<OpRequestRef> maybe_get_op() const {
+    assert(qitem);
+    return qitem->maybe_get_op();
+  }
+  uint64_t get_reserved_pushes() const {
+    assert(qitem);
+    return qitem->get_reserved_pushes();
+  }
+  void run(OSD *osd, ThreadPool::TPHandle &handle) {
+    assert(qitem);
+    qitem->run(osd, handle);
+  }
+  unsigned get_priority() const { return priority; }
+  int get_cost() const { return cost; }
+  utime_t get_start_time() const { return start_time; }
+  entity_inst_t get_owner() const { return owner; }
+  epoch_t get_map_epoch() const { return map_epoch; }
+};
+
+#if 0
 class PGQueueable {
   typedef boost::variant<
     OpRequestRef,
@@ -453,6 +547,7 @@ public:
   entity_inst_t get_owner() const { return owner; }
   epoch_t get_map_epoch() const { return map_epoch; }
 };
+#endif
 
 class OSDService {
 public:
