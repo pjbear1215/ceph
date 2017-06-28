@@ -337,6 +337,7 @@ typedef ceph::shared_ptr<DeletingState> DeletingStateRef;
 
 class OSD;
 
+#if 0
 struct PGScrub {
   epoch_t epoch_queued;
   explicit PGScrub(epoch_t e) : epoch_queued(e) {}
@@ -363,28 +364,28 @@ struct PGRecovery {
 	       << ", reserved_pushes: " << reserved_pushes << ")";
   }
 };
+#endif
 
-class OpQueueItem {
+
+class OrderLocker {
 public:
-  class OrderLocker {
-  public:
-    using Ref = unique_ptr<OrderLocker>;
-    virtual void lock_suspend_timeout(ThreadPool::TPHandle &handle) = 0;
-    virtual void unlock() = 0;
-    virtual ~OrderLocker() {}
-  };
-  // Abstraction for operations queueable in the op queue
-  class PGQueueable {
-  public:
-    using Ref = std::unique_ptr<OpQueueable>;
-    
-    /// Items with the same queue token will end up in the same shard
-    virtual uint32_t get_queue_token() const = 0;
-    
-    /* Items will be dequeued and locked atomically w.r.t. other items with the
-       * same ordering token */
-    virtual void *get_ordering_token() const = 0;
-    virtual OrderLocker::Ref get_order_locker() = 0;
+  //using Ref = unique_ptr<OrderLocker>;
+  virtual void lock_suspend_timeout(ThreadPool::TPHandle &handle) = 0;
+  virtual void lock(PGRef pg, spg_t pgid) = 0;
+  virtual void unlock() = 0;
+  virtual ~OrderLocker() {}
+  typedef boost::intrusive_ptr<OrderLocker> Ref;
+};
+//typedef OrderLocker::Ref OrderLockerRef;
+typedef ceph::shared_ptr<OrderLocker> OrderLockerRef;
+
+// Abstraction for operations queueable in the op queue
+class OpQueueable {
+public:
+  //using Ref = std::unique_ptr<OpQueueable>;
+  
+  //virtual OrderLocker::Ref get_order_locker(PGRef pg) = 0;
+  virtual OrderLockerRef get_order_locker(PGRef pg) = 0;
     
     virtual boost::optional<OpRequestRef> maybe_get_op() const {
       return boost::none;
@@ -396,39 +397,112 @@ public:
     
     virtual ostream &print(ostream &rhs) const = 0;
     
-    virtual void run(OSD *osd, ThreadPool::TPHandle &handle) = 0;
+    virtual void run(OSD *osd, PGRef &pg, ThreadPool::TPHandle &handle) = 0;
     virtual ~OpQueueable() {}
+
+    //typedef boost::intrusive_ptr<OpQueueable> Ref;
+};
+//typedef OpQueueable::Ref OpQueueableRef;
+typedef ceph::shared_ptr<OpQueueable> OpQueueableRef;
+
+class PGQueueable {
+public:
+#if 0
+  class OrderLocker {
+  public:
+    using Ref = unique_ptr<OrderLocker>;
+    virtual void lock_suspend_timeout(ThreadPool::TPHandle &handle) = 0;
+    virtual void lock(PGRef pg, spg_t pgid) = 0;
+    virtual void unlock() = 0;
+    virtual ~OrderLocker() {}
   };
 
+  // Abstraction for operations queueable in the op queue
+  class OpQueueable {
+  public:
+    using Ref = std::unique_ptr<OpQueueable>;
+    
+    virtual OrderLocker::Ref get_order_locker(PGRef pg) = 0;
+      
+    virtual boost::optional<OpRequestRef> maybe_get_op() const {
+      return boost::none;
+    }
+    
+    virtual uint64_t get_reserved_pushes() const {
+      return 0;
+    }
+    
+    virtual ostream &print(ostream &rhs) const = 0;
+    
+    virtual void run(OSD *osd, PGRef &pg, ThreadPool::TPHandle &handle) = 0;
+    virtual ~OpQueueable() {}
+  };
+#endif
+
 private:
-  OpQueueable::Ref qitem;
+  //OpQueueable::Ref qitem;
+  OpQueueableRef qitem;
   int cost;
   unsigned priority;
   utime_t start_time;
   entity_inst_t owner;
+  epoch_t map_epoch;    ///< an epoch we expect the PG to exist in
 
 public:
-  OpQueueItem(
-    OpQueueable::Ref &&item,
+  PGQueueable(
+    //OpQueueable::Ref &&item,
+    OpQueueableRef item,
     int cost,
     unsigned priority,
     utime_t start_time,
-    const entity_inst_t &owner)
-    : qitem(std::move(item)),
+    const entity_inst_t &owner,
+    epoch_t e)
+    //: qitem(std::move(item)),
+    : qitem(item),
       cost(cost),
       priority(priority),
       start_time(start_time),
-      owner(owner) {}
-  OpQueueItem(OpQueueItem &&) = default;
-  OpQueueItem(const OpQueueItem &) = delete;
-  OpQueueItem &operator=(OpQueueItem &&) = default;
-  OpQueueItem &operator=(const OpQueueItem &) = delete;
+      owner(owner),
+      map_epoch(e) {}
 
-  OrderLocker::Ref get_order_locker() {
+  friend ostream& operator<<(ostream& out, const PGQueueable& q) {
+    return out << "PGQueueable(" //<< qitem 
+	       << " prio " << q.priority << " cost " << q.cost
+	       << " e" << q.map_epoch << ")";
+  }
+#if 0
+  PGQueueable(
+    const PGSnapTrim &op, int cost, unsigned priority, utime_t start_time,
+    const entity_inst_t &owner, epoch_t e)
+    : cost(cost), priority(priority), start_time(start_time),
+      owner(owner), map_epoch(e) {}
+  PGQueueable(
+    const PGScrub &op, int cost, unsigned priority, utime_t start_time,
+    const entity_inst_t &owner, epoch_t e)
+    : cost(cost), priority(priority), start_time(start_time),
+      owner(owner), map_epoch(e) {}
+  PGQueueable(
+    const PGRecovery &op, int cost, unsigned priority, utime_t start_time,
+    const entity_inst_t &owner, epoch_t e)
+    : cost(cost), priority(priority), start_time(start_time),
+      owner(owner), map_epoch(e)  {}
+#endif
+
+  //PGQueueable(PGQueueable &) = default;
+#if 0
+  PGQueueable(PGQueueable &&) = default;
+  PGQueueable(const PGQueueable &) = delete;
+  PGQueueable &operator=(PGQueueable &&) = default;
+  PGQueueable &operator=(const PGQueueable &) = delete;
+#endif
+
+  //OrderLocker::Ref get_order_locker(PGRef pg) {
+  OrderLockerRef get_order_locker(PGRef pg) {
     assert(qitem);
-    return qitem->get_order_locker();
+    return qitem->get_order_locker(pg);
   }
 
+#if 0
   uint32_t get_queue_token() const {
     assert(qitem);
     return qitem->get_queue_token();
@@ -437,6 +511,7 @@ public:
     assert(qitem);
     return qitem->get_ordering_token();
   }
+#endif
 
   boost::optional<OpRequestRef> maybe_get_op() const {
     assert(qitem);
@@ -446,9 +521,9 @@ public:
     assert(qitem);
     return qitem->get_reserved_pushes();
   }
-  void run(OSD *osd, ThreadPool::TPHandle &handle) {
+  void run(OSD *osd, PGRef &pg, ThreadPool::TPHandle &handle) {
     assert(qitem);
-    qitem->run(osd, handle);
+    qitem->run(osd, pg, handle);
   }
   unsigned get_priority() const { return priority; }
   int get_cost() const { return cost; }
@@ -572,8 +647,10 @@ public:
   GenContextWQ recovery_gen_wq;
   ClassHandler  *&class_handler;
 
+#if 0
   void enqueue_back(spg_t pgid, PGQueueable qi);
   void enqueue_front(spg_t pgid, PGQueueable qi);
+#endif
 
   void maybe_inject_dispatch_delay() {
     if (g_conf->osd_debug_inject_dispatch_delay_probability > 0) {
@@ -1064,6 +1141,8 @@ public:
   AsyncReserver<spg_t> snap_reserver;
   void queue_for_snap_trim(PG *pg);
 
+  void queue_for_scrub(PG *pg, bool with_high_priority);
+#if 0
   void queue_for_scrub(PG *pg, bool with_high_priority) {
     unsigned scrub_queue_priority = pg->scrubber.priority;
     if (with_high_priority && scrub_queue_priority < cct->_conf->osd_client_op_priority) {
@@ -1078,6 +1157,14 @@ public:
 	ceph_clock_now(),
 	entity_inst_t(),
 	pg->get_osdmap()->get_epoch()));
+  }
+#endif
+  void _queue_op(spg_t pg, OpRequestRef op, epoch_t epoch, bool front);
+  void queue_op(spg_t pg, OpRequestRef op, epoch_t e) {
+    _queue_op(pg, op, e, false);
+  }
+  void queue_op_front(spg_t pg, OpRequestRef op, epoch_t e) {
+    _queue_op(pg, op, e, true);
   }
 
 private:
@@ -1094,6 +1181,8 @@ private:
 #endif
   bool _recover_now(uint64_t *available_pushes);
   void _maybe_queue_recovery();
+  void _queue_for_recovery(pair<epoch_t, PGRef> p, uint64_t reserved_pushes);
+#if 0
   void _queue_for_recovery(
     pair<epoch_t, PGRef> p, uint64_t reserved_pushes) {
     assert(recovery_lock.is_locked_by_me());
@@ -1107,6 +1196,7 @@ private:
 	entity_inst_t(),
 	p.first));
   }
+#endif
 public:
   void start_recovery_op(PG *pg, const hobject_t& soid);
   void finish_recovery_op(PG *pg, const hobject_t& soid, bool dequeue);
