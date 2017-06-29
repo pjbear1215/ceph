@@ -166,22 +166,6 @@ static ostream& _prefix(std::ostream* _dout, int whoami, epoch_t epoch) {
   return *_dout << "osd." << whoami << " " << epoch << " ";
 }
 
-void PGQueueable::RunVis::operator()(const OpRequestRef &op) {
-  return osd->dequeue_op(pg, op, handle);
-}
-
-void PGQueueable::RunVis::operator()(const PGSnapTrim &op) {
-  return pg->snap_trimmer(op.epoch_queued);
-}
-
-void PGQueueable::RunVis::operator()(const PGScrub &op) {
-  return pg->scrub(op.epoch_queued, handle);
-}
-
-void PGQueueable::RunVis::operator()(const PGRecovery &op) {
-  return osd->do_recovery(pg.get(), op.epoch_queued, op.reserved_pushes, handle);
-}
-
 //Initial features in new superblock.
 //Features here are also automatically upgraded
 CompatSet OSD::get_osd_initial_compat_set() {
@@ -1668,94 +1652,50 @@ void OSDService::handle_misdirected_op(PG *pg, OpRequestRef op)
 	       << " in e" << m->get_map_epoch() << "/" << osdmap->get_epoch();
 }
 
-#if 0
-void OSDService::enqueue_back(spg_t pgid, PGQueueable qi)
-{
-  osd->op_shardedwq.queue(make_pair(pgid, qi));
-}
-
-void OSDService::enqueue_front(spg_t pgid, PGQueueable qi)
-{
-  osd->op_shardedwq.queue_front(make_pair(pgid, qi));
-}
-#endif
-
 void OSDService::queue_for_peering(PG *pg)
 {
   peering_wq.queue(pg);
 }
 
-#if 0
-void OSDService::queue_for_snap_trim(PG *pg)
-{
-  dout(10) << "queueing " << *pg << " for snaptrim" << dendl;
-  osd->op_shardedwq.queue(
-    make_pair(
-      pg->info.pgid,
-      PGQueueable(
-	PGSnapTrim(pg->get_osdmap()->get_epoch()),
-	cct->_conf->osd_snap_trim_cost,
-	cct->_conf->osd_snap_trim_priority,
-	ceph_clock_now(),
-	entity_inst_t(),
-	pg->get_osdmap()->get_epoch())));
-}
-#endif
-
 /// Implements boilerplate for operations queued for the pg lock
-class PGOpQueueable : public PGQueueable::OpQueueable {
+class PGOpQueueable : public OpQueueable {
+protected:
   PGRef pg;
   spg_t pgid;
-protected:
-#if 0
-  spg_t get_pgid() const {
-    return pg->get_pgid();
-  }
-#endif
 public:
   PGOpQueueable(PGRef pg) : pg(pg) {}
   PGOpQueueable(spg_t pgid) : pgid(pgid) {}
   PGOpQueueable() {}
-#if 0
-  virtual uint32_t get_queue_token() const override final {
-    return pg->get_pgid().ps();
-  }
 
-  virtual void *get_ordering_token() const override final {
-    return pg.get();
-  }
-#endif
-
-  virtual PGQueueable::OrderLocker::Ref get_order_locker(PGRef pg) override final {
-    class Locker : public OpQueueItem::OrderLocker {
-      PGRef pg;
+  virtual OrderLockerRef get_order_locker(PGRef &pg, OSD *osd) override final {
+    class Locker : public OrderLocker {
+      PGRef &pg;
       spg_t pgid;
+      OSD *osd;
     public:
-      Locker(PGRef pg, spg_t pgid) : pg(pg), pgid(pgid) {}
-#if 0
-      virtual void lock_suspend_timeout(
-        ThreadPool::TPHandle &handle) override final {
-        pg->lock_suspend_timeout(handle);
-      }
-#endif
+      Locker(PGRef &pg, spg_t pgid, OSD *osd) : pg(pg), pgid(pgid), osd(osd) {}
       virtual void lock() override final {
 	if (!pg) {
-	  pg = osd->_lookup_lock_pg(pgid);
+	  if (osd) {
+	    lgeneric_dout(g_ceph_context, 0) << " pg is null !!! " << dendl;
+	    pg = osd->_lookup_lock_pg(pgid);
+	  } else {
+	    assert(0 == "No OSDService");
+	  }
 	} else {
 	  pg->lock();
 	}
       }
       virtual void unlock() override final {
-        pg->unlock();
+	if (pg) {
+	  pg->unlock();
+	} else {
+	  assert(0 == "No PGRef");
+	}
       }
     };
-    if (pg) {
-      return OpQueueItem::OrderLocker::Ref(
-	new Locker(pg, pgid));
-    } else {
-      return OpQueueItem::OrderLocker::Ref(
-	new Locker(NULL, pgid));
-    }
+    return OrderLockerRef(
+      new Locker(pg, pgid, osd));
   }
 
   virtual void run_with_pg(OSD *osd, PGRef &pg, ThreadPool::TPHandle &handle) = 0;
@@ -1776,12 +1716,12 @@ void OSDService::queue_for_snap_trim(PG *pg)
       epoch_t epoch_queued)
       : PGOpQueueable(pg), epoch_queued(epoch_queued) {}
     virtual ostream &print(ostream &rhs) const override final {
-      return rhs << "PGSnapTrim(pgid=" << get_pgid()
+      return rhs << "PGSnapTrim(pgid=" << pg->get_pgid()
                  << "epoch_queued=" << epoch_queued
                  << ")";
     }
     virtual void run_with_pg(
-      OSD *osd, PGRef pg, ThreadPool::TPHandle &handle) override final {
+      OSD *osd, PGRef &pg, ThreadPool::TPHandle &handle) override final {
       pg->snap_trimmer(epoch_queued);
     }
   };
@@ -1790,7 +1730,7 @@ void OSDService::queue_for_snap_trim(PG *pg)
     make_pair(
       pg->info.pgid,
       PGQueueable(
-	unique_ptr<OpQueueItem::OpQueueable>(
+	unique_ptr<OpQueueable>(
 	  new PGSnapTrim(pg, pg->get_osdmap()->get_epoch())),
 	cct->_conf->osd_snap_trim_cost,
 	cct->_conf->osd_snap_trim_priority,
@@ -1815,26 +1755,26 @@ void OSDService::queue_for_scrub(PG *pg, bool with_high_priority)
       epoch_t epoch_queued)
       : PGOpQueueable(pg), epoch_queued(epoch_queued) {}
     virtual ostream &print(ostream &rhs) const override final {
-      return rhs << "PGScrub(pgid=" << get_pgid()
+      return rhs << "PGScrub(pgid=" << pg->get_pgid()
                  << "epoch_queued=" << epoch_queued
                  << ")";
     }
     virtual void run_with_pg(
-      OSD *osd, PGRef pg, ThreadPool::TPHandle &handle) override final {
+      OSD *osd, PGRef &pg, ThreadPool::TPHandle &handle) override final {
       pg->scrub(epoch_queued, handle);
     }
   };
 
   osd->op_shardedwq.queue(
-    pg->info.pgid,
-    PGQueueable(
+    make_pair(
       pg->info.pgid,
-      unique_ptr<OpQueueItem::OpQueueable>(new PGScrub(pg, pg->get_osdmap()->get_epoch())),
-      cct->_conf->osd_scrub_cost,
-      scrub_queue_priority,
-      ceph_clock_now(),
-      entity_inst_t(),
-      pg->get_osdmap()->get_epoch()));
+      PGQueueable(
+	unique_ptr<OpQueueable>(new PGScrub(pg, pg->get_osdmap()->get_epoch())),
+	cct->_conf->osd_scrub_cost,
+	scrub_queue_priority,
+	ceph_clock_now(),
+	entity_inst_t(),
+	pg->get_osdmap()->get_epoch())));
 }
 
 void OSDService::_queue_for_recovery(
@@ -1853,7 +1793,7 @@ void OSDService::_queue_for_recovery(
         epoch_queued(epoch_queued),
         reserved_pushes(reserved_pushes) {}
     virtual ostream &print(ostream &rhs) const override final {
-      return rhs << "PGRecovery(pgid=" << get_pgid()
+      return rhs << "PGRecovery(pgid=" << pg->get_pgid()
                  << "epoch_queued=" << epoch_queued
                  << "reserved_pushes=" << reserved_pushes
                  << ")";
@@ -1867,16 +1807,18 @@ void OSDService::_queue_for_recovery(
     }
   };
   assert(recovery_lock.is_locked_by_me());
-  op_wq.queue(
-    PGQueueable(
-      unique_ptr<PGQueueable::OpQueueable>(
-        new PGRecovery(
-          p.second, p.first, reserved_pushes)),
-      cct->_conf->osd_recovery_cost,
-      cct->_conf->osd_recovery_priority,
-      ceph_clock_now(),
-      entity_inst_t(),
-      p.first));
+  osd->op_shardedwq.queue(
+    make_pair(
+      p.second->info.pgid,
+      PGQueueable(
+	unique_ptr<OpQueueable>(
+	  new PGRecovery(
+	    p.second, p.first, reserved_pushes)),
+	cct->_conf->osd_recovery_cost,
+	cct->_conf->osd_recovery_priority,
+	ceph_clock_now(),
+	entity_inst_t(),
+	p.first)));
 }
 
 void OSDService::_queue_op(
@@ -1903,26 +1845,28 @@ void OSDService::_queue_op(
 
   if (front) {
     osd->op_shardedwq.queue_front(
-      pg,
-      PGQueueable(
-	unique_ptr<PGQueueable::OpQueueable>(
-	  new PGOpItem(pg, op)),
-	op->get_req()->get_cost(),
-	op->get_req()->get_priority(),
-	op->get_req()->get_recv_stamp(),
-	op->get_req()->get_source_inst(),
-	epoch));
+      make_pair(
+	pg,
+	PGQueueable(
+	  unique_ptr<OpQueueable>(
+	    new PGOpItem(pg, op)),
+	  op->get_req()->get_cost(),
+	  op->get_req()->get_priority(),
+	  op->get_req()->get_recv_stamp(),
+	  op->get_req()->get_source_inst(),
+	  epoch)));
   } else {
     osd->op_shardedwq.queue(
-      pg,
-      PGQueueable(
-	unique_ptr<PGQueueable::OpQueueable>(
-	  new PGOpItem(pg, op)),
-	op->get_req()->get_cost(),
-	op->get_req()->get_priority(),
-	op->get_req()->get_recv_stamp(),
-	op->get_req()->get_source_inst(),
-	epoch));
+      make_pair(
+	pg,
+	PGQueueable(
+	  unique_ptr<OpQueueable>(
+	    new PGOpItem(pg, op)),
+	  op->get_req()->get_cost(),
+	  op->get_req()->get_priority(),
+	  op->get_req()->get_recv_stamp(),
+	  op->get_req()->get_source_inst(),
+	  epoch)));
   }
 }
 
@@ -9438,8 +9382,7 @@ void OSD::enqueue_op(spg_t pg, OpRequestRef& op, epoch_t epoch)
   op->osd_trace.keyval("priority", op->get_req()->get_priority());
   op->osd_trace.keyval("cost", op->get_req()->get_cost());
   op->mark_queued_for_pg();
-  osd->queue_op(pg, op, epoch);
-  //op_shardedwq.queue(make_pair(pg, PGQueueable(op, epoch)));
+  service.queue_op(pg, op, epoch);
 }
 
 
@@ -10126,16 +10069,9 @@ void OSD::ShardedOpWQ::_process(uint32_t thread_index, heartbeat_handle_d *hb)
   osd->service.maybe_inject_dispatch_delay();
 
   // [lookup +] lock pg (if we have it)
-  PGQueueable::OrderLocker::Ref l;
-  l = item.second.get_order_locker(pg);
+  OrderLockerRef l;
+  l = item.second.get_order_locker(pg, osd);
   l->lock();
-#if 0
-  if (!pg) {
-    pg = osd->_lookup_lock_pg(item.first);
-  } else {
-    pg->lock();
-  }
-#endif
 
   osd->service.maybe_inject_dispatch_delay();
 
