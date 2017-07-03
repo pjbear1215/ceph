@@ -1981,7 +1981,7 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     }
   }
 
-  dout(10) << "do_op " << *m
+  dout(0) << "do_op " << *m
 	   << (op->may_write() ? " may_write" : "")
 	   << (op->may_read() ? " may_read" : "")
 	   << (op->may_cache() ? " may_cache" : "")
@@ -2072,6 +2072,7 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     if (got) {
       dout(3) << __func__ << " dup " << m->get_reqid()
 	      << " version " << version << dendl;
+      dout(0) << __func__ << " oid: " << m->get_hobj() << dendl;
       assert(0);
       if (already_complete(version)) {
 	osd->reply_op_error(op, return_code, version, user_version);
@@ -3237,8 +3238,8 @@ void PrimaryLogPG::do_proxy_chunked_op(OpRequestRef op, const hobject_t& missing
 	/* | data | = | data 	       |
 		      | chunk_length   |	   
 	   | data | = | data | no data | */
-	if (no_index || ( (t_cursor >= cursor) &&   
-			(t_cursor+chunk_length <= obc->obs.oi.manifest.ori_size ))) {
+	if (no_index || ((t_cursor >= cursor) &&   
+			 (t_cursor+chunk_length <= obc->obs.oi.manifest.ori_size ))) {
 	  bufferptr tmp_buf(chunk_length);
 	  tmp_buf.zero();
 	  bufferlist write_buf;
@@ -3411,7 +3412,7 @@ void PrimaryLogPG::do_dedup_overwrite(OpRequestRef op, ObjectContextRef obc, int
 
   ObjectOperation * obj_op = new ObjectOperation;
   assert(obj_op);
-  OSDOp &osd_op = obj_op->add_op(CEPH_OSD_OP_WRITE);
+  OSDOp &osd_op = obj_op->add_op(CEPH_OSD_OP_WRITEINCREF);
 #if 0
   if (real_offset >= ori_offset) {
     osd_op.op.extent.offset = 0;
@@ -3441,7 +3442,6 @@ void PrimaryLogPG::do_dedup_overwrite(OpRequestRef op, ObjectContextRef obc, int
           << " real_length: " << real_length
           << dendl;
   write_buf.clear();
-
 }
 
 ceph_tid_t PrimaryLogPG::do_dedup_write(string oid_fp, OpRequestRef op, ObjectContextRef obc, int op_index,
@@ -5168,6 +5168,28 @@ void PrimaryLogPG::maybe_create_new_object(
   }
 }
 
+void PrimaryLogPG::maybe_create_new_ref_object(
+  OpContext *ctx,
+  bool ignore_transaction)
+{
+  ObjectState& obs = ctx->new_obs;
+  if (!obs.exists) {
+    ctx->delta_stats.num_objects++;
+    obs.exists = true;
+    assert(!obs.oi.is_whiteout());
+    obs.oi.new_object();
+    obs.oi.set_flag(object_info_t::FLAG_MANIFEST);
+    obs.oi.manifest.type = object_manifest_t::TYPE_REFERENCE_COUNT;
+    obs.oi.manifest.ref_cnt = 1;
+    if (!ignore_transaction)
+      ctx->op_t->create(obs.oi.soid);
+  } else if (obs.oi.is_whiteout()) {
+    dout(10) << __func__ << " clearing whiteout on " << obs.oi.soid << dendl;
+    ctx->new_obs.oi.clear_flag(object_info_t::FLAG_WHITEOUT);
+    --ctx->delta_stats.num_whiteouts;
+  }
+}
+
 struct C_ChecksumRead : public Context {
   PrimaryLogPG *primary_log_pg;
   OSDOp &osd_op;
@@ -6737,6 +6759,144 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	dout(10) << "set-redirect oid:" << oi.soid << " user_version: " << oi.user_version << dendl;
       }
 
+      break;
+
+    case CEPH_OSD_OP_WRITEINCREF:
+      ++ctx->num_write;
+      {
+        __u32 seq = oi.truncate_seq;
+	tracepoint(osd, do_osd_op_pre_write, soid.oid.name.c_str(), soid.snap.val, oi.size, seq, op.extent.offset, op.extent.length, op.extent.truncate_size, op.extent.truncate_seq);
+	if (op.extent.length != osd_op.indata.length()) {
+	  result = -EINVAL;
+	  break;
+	}
+
+	if (pool.info.has_flag(pg_pool_t::FLAG_WRITE_FADVISE_DONTNEED))
+	  op.flags = op.flags | CEPH_OSD_OP_FLAG_FADVISE_DONTNEED;
+
+	if (pool.info.requires_aligned_append() &&
+	    (op.extent.offset % pool.info.required_alignment() != 0)) {
+	  result = -EOPNOTSUPP;
+	  break;
+	}
+
+	if (!obs.exists) {
+	  if (pool.info.requires_aligned_append() && op.extent.offset) {
+	    result = -EOPNOTSUPP;
+	    break;
+	  }
+	} else if (op.extent.offset != oi.size &&
+		   pool.info.requires_aligned_append()) {
+	  result = -EOPNOTSUPP;
+	  break;
+	}
+	
+	if (op.extent.offset == 0 && osd_op.indata.length() == 0) {
+	  if (!obs.exists) {
+	    maybe_create_new_ref_object(ctx);
+	  } else {
+	    oi.manifest.ref_cnt++;
+	    ctx->modify = true;
+	  }
+	  break;
+	}
+
+	/* ignore truncate */
+#if 0
+        if (seq && (seq > op.extent.truncate_seq) &&
+            (op.extent.offset + op.extent.length > oi.size)) {
+	  // old write, arrived after trimtrunc
+	  op.extent.length = (op.extent.offset > oi.size ? 0 : oi.size - op.extent.offset);
+	  dout(10) << " old truncate_seq " << op.extent.truncate_seq << " < current " << seq
+		   << ", adjusting write length to " << op.extent.length << dendl;
+	  bufferlist t;
+	  t.substr_of(osd_op.indata, 0, op.extent.length);
+	  osd_op.indata.swap(t);
+        }
+	if (op.extent.truncate_seq > seq) {
+	  // write arrives before trimtrunc
+	  if (obs.exists && !oi.is_whiteout()) {
+	    dout(10) << " truncate_seq " << op.extent.truncate_seq << " > current " << seq
+		     << ", truncating to " << op.extent.truncate_size << dendl;
+	    t->truncate(soid, op.extent.truncate_size);
+	    oi.truncate_seq = op.extent.truncate_seq;
+	    oi.truncate_size = op.extent.truncate_size;
+	    if (op.extent.truncate_size != oi.size) {
+	      ctx->delta_stats.num_bytes -= oi.size;
+	      ctx->delta_stats.num_bytes += op.extent.truncate_size;
+	      oi.size = op.extent.truncate_size;
+	    }
+	  } else {
+	    dout(10) << " truncate_seq " << op.extent.truncate_seq << " > current " << seq
+		     << ", but object is new" << dendl;
+	    oi.truncate_seq = op.extent.truncate_seq;
+	    oi.truncate_size = op.extent.truncate_size;
+	  }
+	}
+#endif
+	result = check_offset_and_length(op.extent.offset, op.extent.length, cct->_conf->osd_max_object_size);
+	if (result < 0)
+	  break;
+
+	maybe_create_new_ref_object(ctx);
+
+	if (op.extent.length == 0) {
+	  assert(0);	
+	} else {
+	  t->write(
+	    soid, op.extent.offset, op.extent.length, osd_op.indata, op.flags);
+	}
+
+
+	if (oi.size == 0) {
+	  if (op.extent.offset == 0 && op.extent.length >= oi.size)
+	    obs.oi.set_data_digest(osd_op.indata.crc32c(-1));
+	  else if (op.extent.offset == oi.size && obs.oi.is_data_digest())
+	    obs.oi.set_data_digest(osd_op.indata.crc32c(obs.oi.data_digest));
+	  else
+	    obs.oi.clear_data_digest();
+	  write_update_size_and_usage(ctx->delta_stats, oi, ctx->modified_ranges,
+				      op.extent.offset, op.extent.length);
+	} else {
+	  if (oi.manifest.type != object_manifest_t::TYPE_REFERENCE_COUNT) {
+	    oi.set_flag(object_info_t::FLAG_MANIFEST);
+	    oi.manifest.type = object_manifest_t::TYPE_REFERENCE_COUNT;
+	    oi.manifest.ref_cnt = 1;
+	    ctx->modify = true;
+	  } else {
+	    oi.manifest.ref_cnt++;
+	    ctx->modify = true;
+	  }
+	}
+
+	dout(0) << __func__ << "incref oid: " << soid.oid << " offset: " << op.extent.offset 
+		<< " length: " << op.extent.length 
+		<< " oi.size: " << oi.size  
+		<< " ref_cnt: " << oi.manifest.ref_cnt << dendl;
+      }
+
+      break;
+
+    case CEPH_OSD_OP_DECREF:
+      ++ctx->num_write;
+      {
+	if (!obs.exists) {
+	  result = -ENOENT;
+	  break;
+	}
+	if (!obs.oi.test_flag(object_info_t::FLAG_MANIFEST)) {
+	  result = -ENOENT;
+	  break;
+	}
+	oi.manifest.ref_cnt--;
+	ctx->modify = true;
+
+	dout(0) << __func__ << "decref oid: " << soid.oid << " offset: " << op.extent.offset 
+		<< " length: " << op.extent.length 
+		<< " oi.size: " << oi.size  
+		<< " ref_cnt: " << oi.manifest.ref_cnt << dendl;
+
+      }
       break;
 
     case CEPH_OSD_OP_SET_CHUNK:
@@ -10247,9 +10407,9 @@ int PrimaryLogPG::do_manifest_flush(OpRequestRef op, ObjectContextRef obc,
       write_buf.append(tmp_buf);
       write_buf.copy_in(0, s_length, chunks_data.c_str()+(s_offset-cursor));
       if (soid.oid.name == tgt_soid.oid.name) {
-	obj_op.add_data(CEPH_OSD_OP_WRITE, s_offset, s_length, write_buf);
+	obj_op.add_data(CEPH_OSD_OP_WRITEINCREF, s_offset, s_length, write_buf);
       } else {
-	obj_op.add_data(CEPH_OSD_OP_WRITE, 0, s_length, write_buf);
+	obj_op.add_data(CEPH_OSD_OP_WRITEINCREF, 0, s_length, write_buf);
       }
 
       unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY | 
