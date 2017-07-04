@@ -1193,6 +1193,12 @@ struct pg_pool_t {
     CACHEMODE_READPROXY = 5,             ///< proxy reads, write to cache flush later
     CACHEMODE_PROXY = 6,                 ///< proxy if not in cache
   } cache_mode_t;
+  typedef enum {
+    MANIFEST_NONE = 0,
+    MANIFEST_REDIRECT = 1,                 ///< 
+    MANIFEST_DEDUP_PROXY = 2,                 ///< 
+    MANIFEST_DEDUP_WRITEBACK = 3,                 ///< 
+  } manifest_mode_t;
   static const char *get_cache_mode_name(cache_mode_t m) {
     switch (m) {
     case CACHEMODE_NONE: return "none";
@@ -1202,6 +1208,15 @@ struct pg_pool_t {
     case CACHEMODE_READFORWARD: return "readforward";
     case CACHEMODE_READPROXY: return "readproxy";
     case CACHEMODE_PROXY: return "proxy";
+    default: return "unknown";
+    }
+  }
+  static const char *get_manifest_mode_name(manifest_mode_t m) {
+    switch (m) {
+    case MANIFEST_NONE: return "none";
+    case MANIFEST_REDIRECT: return "manifest_redirect";
+    case MANIFEST_DEDUP_PROXY: return "manifest_dedup_proxy";
+    case MANIFEST_DEDUP_WRITEBACK: return "manifest_dedup_writeback";
     default: return "unknown";
     }
   }
@@ -1221,6 +1236,17 @@ struct pg_pool_t {
     if (s == "proxy")
       return CACHEMODE_PROXY;
     return (cache_mode_t)-1;
+  }
+  static manifest_mode_t get_manifest_mode_from_str(const string& s) {
+    if (s == "none")
+      return MANIFEST_NONE;
+    if (s == "manifest_redirect")
+      return MANIFEST_REDIRECT;
+    if (s == "manifest_dedup_proxy")
+      return MANIFEST_DEDUP_PROXY;
+    if (s == "manifest_dedup_writeback")
+      return MANIFEST_DEDUP_WRITEBACK;
+    return (manifest_mode_t)-1;
   }
   const char *get_cache_mode_name() const {
     return get_cache_mode_name(cache_mode);
@@ -1347,6 +1373,8 @@ public:
 
   pool_opts_t opts; ///< options
 
+  manifest_mode_t manifest_mode;
+
 private:
   vector<uint32_t> grade_table;
 
@@ -1396,7 +1424,8 @@ public:
       stripe_width(0),
       expected_num_objects(0),
       fast_read(false),
-      opts()
+      opts(),
+      manifest_mode(MANIFEST_NONE)
   { }
 
   void dump(Formatter *f) const;

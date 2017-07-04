@@ -3666,6 +3666,32 @@ bool PrimaryLogPG::can_proxy_chunked_write(OpRequestRef op)
   return ret;
 }
 
+/* check if message is for RBD metadata */
+bool PrimaryLogPG::need_bypass_oid(string oid_name)                                                                  
+{ 
+  if (oid_name.find('.') <= 0)                                                                                       
+    return true;
+  string sub = oid_name.substr(0, strlen("rbd_id"));                                                                 
+  if (!sub.compare("rbd_id")) {
+    dout(20) << __func__ << " oid_name: " << oid_name << " sub: " << sub << dendl;                                   
+    return true;                                                                                                     
+  }
+  int size = oid_name.find_last_of('.');                                                                             
+  if (size > 2) {
+    sub = oid_name.substr(size+1);                                                                                   
+    if (!sub.compare("rbd")) {
+      dout(20) << __func__ << " oid_name: " << oid_name << " sub: " << sub << dendl;                                 
+      return true;                                                                                                   
+    }                                                                                                                
+  }
+  sub = oid_name.substr(0, strlen("rbd_directory"));                                                                 
+  if (!sub.compare("rbd_directory")) {
+    dout(20) << __func__ << " oid_name: " << oid_name << " sub: " << sub << dendl;                                   
+    return true;                                                                                                     
+  }
+  return false;                                                                                                      
+}  
+
 void PrimaryLogPG::finish_proxy_write(hobject_t oid, ceph_tid_t tid, int r)
 {
   dout(10) << __func__ << " " << oid << " tid " << tid
@@ -5159,6 +5185,18 @@ void PrimaryLogPG::maybe_create_new_object(
     obs.exists = true;
     assert(!obs.oi.is_whiteout());
     obs.oi.new_object();
+    if (!need_bypass_oid(obs.oi.soid.oid.name)) {
+      switch (pool.info.manifest_mode) {
+	case pg_pool_t::MANIFEST_DEDUP_PROXY:
+	case pg_pool_t::MANIFEST_DEDUP_WRITEBACK:
+	  obs.oi.set_flag(object_info_t::FLAG_MANIFEST);
+	  obs.oi.manifest.type = object_manifest_t::TYPE_REFERENCE_COUNT;
+	  obs.oi.manifest.ref_cnt = 1;
+	break;
+	default:
+	break; 
+      }
+    }
     if (!ignore_transaction)
       ctx->op_t->create(obs.oi.soid);
   } else if (obs.oi.is_whiteout()) {

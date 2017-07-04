@@ -8907,6 +8907,54 @@ done:
     wait_for_finished_proposal(op, new Monitor::C_Command(mon, op, 0, ss.str(),
 					      get_last_committed() + 1));
     return true;
+  } else if (prefix == "osd tier manifest-mode") {
+    err = check_cluster_features(CEPH_FEATURE_OSD_CACHEPOOL, ss);
+    if (err == -EAGAIN)
+      goto wait;
+    if (err)
+      goto reply;
+    string poolstr;
+    cmd_getval(g_ceph_context, cmdmap, "pool", poolstr);
+    int64_t pool_id = osdmap.lookup_pg_pool_name(poolstr);
+    if (pool_id < 0) {
+      ss << "unrecognized pool '" << poolstr << "'";
+      err = -ENOENT;
+      goto reply;
+    }
+    const pg_pool_t *p = osdmap.get_pg_pool(pool_id);
+    assert(p);
+    if (!p->is_tier()) {
+      ss << "pool '" << poolstr << "' is not a tier";
+      err = -EINVAL;
+      goto reply;
+    }
+    string modestr;
+    cmd_getval(g_ceph_context, cmdmap, "mode", modestr);
+    pg_pool_t::manifest_mode_t mode = pg_pool_t::get_manifest_mode_from_str(modestr);
+    if (mode < 0) {
+      ss << "'" << modestr << "' is not a valid cache mode";
+      err = -EINVAL;
+      goto reply;
+    }
+    // go
+    pg_pool_t *np = pending_inc.get_new_pool(pool_id, p);
+    np->manifest_mode = mode;
+    // set this both when moving to and from cache_mode NONE.  this is to
+    // capture legacy pools that were set up before this flag existed.
+    np->flags |= pg_pool_t::FLAG_INCOMPLETE_CLONES;
+    ss << "set manifest-mode for pool '" << poolstr
+	<< "' to " << pg_pool_t::get_manifest_mode_name(mode);
+    if (mode == pg_pool_t::MANIFEST_NONE) {
+      const pg_pool_t *base_pool = osdmap.get_pg_pool(np->tier_of);
+      assert(base_pool);
+      if (base_pool->read_tier == pool_id ||
+	  base_pool->write_tier == pool_id)
+	ss <<" (WARNING: pool is still configured as read or write tier)";
+    }
+    wait_for_finished_proposal(op, new Monitor::C_Command(mon, op, 0, ss.str(),
+					      get_last_committed() + 1));
+    return true;
+
   } else if (prefix == "osd tier cache-mode") {
     err = check_cluster_features(CEPH_FEATURE_OSD_CACHEPOOL, ss);
     if (err == -EAGAIN)
