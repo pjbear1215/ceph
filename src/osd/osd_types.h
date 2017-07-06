@@ -1374,6 +1374,8 @@ public:
   pool_opts_t opts; ///< options
 
   manifest_mode_t manifest_mode;
+  uint64_t dedup_chunk_size;
+  int tgt_pool;
 
 private:
   vector<uint32_t> grade_table;
@@ -1425,7 +1427,9 @@ public:
       expected_num_objects(0),
       fast_read(false),
       opts(),
-      manifest_mode(MANIFEST_NONE)
+      manifest_mode(MANIFEST_NONE),
+      dedup_chunk_size(0),
+      tgt_pool(-1)
   { }
 
   void dump(Formatter *f) const;
@@ -4444,6 +4448,8 @@ static inline ostream& operator<<(ostream& out, const notify_info_t& n) {
 struct chunk_info_t {
   enum {
     FLAG_DIRTY = 1, 
+    FLAG_MISSING = 2,
+    FLAG_CLEAN = 4,
   };
   uint64_t length;
   hobject_t oid;
@@ -4455,6 +4461,12 @@ struct chunk_info_t {
     string r;
     if (flags & FLAG_DIRTY) {
       r += "|dirty";
+    }
+    if (flags & FLAG_MISSING) {
+      r += "|mssing";
+    }
+    if (flags & FLAG_CLEAN) {
+      r += "|clean";
     }
     if (r.length())
       return r.substr(1);

@@ -8914,6 +8914,7 @@ done:
     if (err)
       goto reply;
     string poolstr;
+    string tgt_poolstr;
     cmd_getval(g_ceph_context, cmdmap, "pool", poolstr);
     int64_t pool_id = osdmap.lookup_pg_pool_name(poolstr);
     if (pool_id < 0) {
@@ -8923,22 +8924,32 @@ done:
     }
     const pg_pool_t *p = osdmap.get_pg_pool(pool_id);
     assert(p);
-    if (!p->is_tier()) {
-      ss << "pool '" << poolstr << "' is not a tier";
-      err = -EINVAL;
-      goto reply;
-    }
     string modestr;
     cmd_getval(g_ceph_context, cmdmap, "mode", modestr);
     pg_pool_t::manifest_mode_t mode = pg_pool_t::get_manifest_mode_from_str(modestr);
     if (mode < 0) {
-      ss << "'" << modestr << "' is not a valid cache mode";
+      ss << "'" << modestr << "' is not a valid manifest mode";
       err = -EINVAL;
       goto reply;
     }
+    cmd_getval(g_ceph_context, cmdmap, "target_pool", tgt_poolstr);
+    int64_t tgt_pool_id = osdmap.lookup_pg_pool_name(tgt_poolstr);
+    if (tgt_pool_id < 0) {
+      ss << "unrecognized pool '" << tgt_poolstr << "'";
+      err = -ENOENT;
+      goto reply;
+    }
+    int64_t dedup_chunk_size = 0;
+    cmd_getval(g_ceph_context, cmdmap, "chunk_size", dedup_chunk_size, int64_t(0));
+    if (dedup_chunk_size <= 0) {
+      dedup_chunk_size = 131072;
+    }
+
     // go
     pg_pool_t *np = pending_inc.get_new_pool(pool_id, p);
     np->manifest_mode = mode;
+    np->dedup_chunk_size = dedup_chunk_size;
+    np->tgt_pool = tgt_pool_id;
     // set this both when moving to and from cache_mode NONE.  this is to
     // capture legacy pools that were set up before this flag existed.
     np->flags |= pg_pool_t::FLAG_INCOMPLETE_CLONES;

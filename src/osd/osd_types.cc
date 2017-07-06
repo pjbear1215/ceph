@@ -1504,6 +1504,7 @@ void pg_pool_t::encode(bufferlist& bl, uint64_t features) const
       (CEPH_FEATURE_RESEND_ON_SPLIT|CEPH_FEATURE_SERVER_JEWEL)) {
     v = 24;
   }
+  v = 26;
 
   ENCODE_START(v, 5, bl);
   ::encode(type, bl);
@@ -1572,6 +1573,8 @@ void pg_pool_t::encode(bufferlist& bl, uint64_t features) const
   if (v >= 26) {
     __u8 c = manifest_mode;
     ::encode(c, bl);
+    ::encode(dedup_chunk_size, bl);
+    ::encode(tgt_pool, bl);
   }
   ENCODE_FINISH(bl);
 }
@@ -1729,8 +1732,11 @@ void pg_pool_t::decode(bufferlist::iterator& bl)
     __u8 v;
     ::decode(v, bl);
     manifest_mode = (manifest_mode_t)v;
+    ::decode(dedup_chunk_size, bl);
+    ::decode(tgt_pool, bl);
   } else {
     manifest_mode = pg_pool_t::MANIFEST_NONE;
+    dedup_chunk_size = 131072;
   }
   DECODE_FINISH(bl);
   calc_pg_masks();
