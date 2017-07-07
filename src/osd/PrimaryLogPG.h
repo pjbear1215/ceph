@@ -1400,6 +1400,7 @@ protected:
 			uint64_t &s_offset);
   void update_dedup_meta(ObjectContextRef obc, uint64_t offset);
   bool need_bypass_oid(string oid_name);
+  void start_dedup_agent();
 
   friend struct C_ProxyChunkRead;
   friend struct C_DedupReadWrite;

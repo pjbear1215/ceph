@@ -2081,7 +2081,6 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
 		<< " user_version: " << user_version << dendl;
 	osd->reply_op_error(op, return_code, version, user_version);
       } else {
-	assert(0);
 	dout(10) << " waiting for " << version << " to commit" << dendl;
         // always queue ondisk waiters, so that we can requeue if needed
 	waiting_for_ondisk[version].push_back(make_pair(op, user_version));
@@ -3247,10 +3246,6 @@ void PrimaryLogPG::do_proxy_chunked_op(OpRequestRef op, const hobject_t& missing
 	  break;
 	}
 	/* read */
-#if 0
-	padding = cursor % chunk_length;
-	padding = chunk_length - padding;
-#endif
 	uint64_t next_length =  chunk_length;
 	if (cursor + next_length > op_length) {
 	  next_length = op_length - cursor;
@@ -3497,10 +3492,8 @@ void PrimaryLogPG::do_dedup_overwrite(OpRequestRef op, ObjectContextRef obc, int
   /* real_offset is chunk_index ! */
   obc->obs.oi.manifest.chunk_map[chunk_index].oid = obc->obs.oi.manifest.chunk_map[0].oid;
   obc->obs.oi.manifest.chunk_map[chunk_index].oid.oid = object_t(oid_fp);
-  obc->obs.oi.manifest.chunk_map[chunk_index].length = chunk_length;
-  if (ori_offset + ori_length < real_offset + real_length) {
-    obc->obs.oi.manifest.chunk_map[chunk_index].length = 
-      ori_offset + ori_length - real_offset;
+  if (obc->obs.oi.manifest.chunk_map[chunk_index].length < (real_offset+real_length-chunk_index)) {
+    obc->obs.oi.manifest.chunk_map[chunk_index].length = real_offset+real_length-chunk_index;
   }
 
   do_dedup_write(oid_fp, op, obc, op_index, chunk_index, obj_op, real_offset, real_length);
@@ -3768,6 +3761,38 @@ bool PrimaryLogPG::need_bypass_oid(string oid_name)
   return false;                                                                                                      
 }  
 
+void PrimaryLogPG::start_dedup_agent()
+{
+  if (!is_active() ||
+      !is_primary()) {
+    agent_clear();
+    return;
+  }
+
+  if (!agent_state) {
+    agent_state.reset(new TierAgentState);
+
+    // choose random starting position
+    agent_state->position = hobject_t();
+    agent_state->position.pool = info.pgid.pool();
+    agent_state->position.set_hash(pool.info.get_random_pg_position(
+      info.pgid.pgid,
+      rand()));
+    agent_state->start = agent_state->position;
+
+    dout(0) << __func__ << " allocated new state, position "
+	     << agent_state->position << dendl;
+  } else {
+    dout(0) << __func__ << " keeping existing state" << dendl;
+  }
+
+  if (info.stats.stats_invalid) {
+    osd->clog->warn() << "pg " << info.pgid << " has invalid (post-split) stats; must scrub before tier agent can activate";
+  }
+
+  agent_choose_mode();
+}                                                                  
+
 void PrimaryLogPG::finish_proxy_write(hobject_t oid, ceph_tid_t tid, int r)
 {
   dout(10) << __func__ << " " << oid << " tid " << tid
@@ -3797,6 +3822,7 @@ void PrimaryLogPG::finish_proxy_write(hobject_t oid, ceph_tid_t tid, int r)
                                               in_progress_op.end(),
 					      pwop->op);
   assert(it != in_progress_op.end());
+
   in_progress_op.erase(it);
   if (in_progress_op.size() == 0) {
     in_progress_proxy_ops.erase(oid);
@@ -7046,8 +7072,17 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  result = -ENOENT;
 	  break;
 	}
+	if (obs.oi.manifest.type != manifest_info_t::TYPE_REFERENCE_COUNT) {
+	  assert(0);
+	  result = -EOPNOTSUPP;
+	  break;
+	}
 	oi.manifest.ref_cnt--;
-	ctx->modify = true;
+	if (oi.manifest.ref_cnt == 0) {
+	  result = _delete_oid(ctx, false, ctx->ignore_cache);
+	} else {
+	  ctx->modify = true;
+	}
 
 	dout(0) << __func__ << "decref oid: " << soid.oid << " offset: " << op.extent.offset 
 		<< " length: " << op.extent.length 
@@ -7065,6 +7100,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  break;
 	}
 	if (!obs.exists) {
+	  start_dedup_agent();
 	  result = -ENOENT;
 	  break;
 	}
@@ -7136,30 +7172,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  t->rmattr(soid, name);
 	}
 #endif
-
-	if (!agent_state) {
-	  agent_state.reset(new TierAgentState);
-
-	  // choose random starting position
-	  agent_state->position = hobject_t();
-	  agent_state->position.pool = info.pgid.pool();
-	  agent_state->position.set_hash(pool.info.get_random_pg_position(
-	    info.pgid.pgid,
-	    rand()));
-	  agent_state->start = agent_state->position;
-
-	  dout(0) << __func__ << " allocated new state, position "
-		   << agent_state->position << dendl;
-	} else {
-	  dout(0) << __func__ << " keeping existing state" << dendl;
-	}
-
-	if (info.stats.stats_invalid) {
-	  osd->clog->warn() << "pg " << info.pgid << " has invalid (post-split) stats; must scrub before tier agent can activate";
-	}
-
-	agent_choose_mode();
-
+	start_dedup_agent();
 	dout(10) << "set-chunked oid:" << oi.soid << " user_version: " << oi.user_version << dendl;
       }
 
@@ -12835,6 +12848,11 @@ void PrimaryLogPG::on_pool_change()
   }
   hit_set_setup();
   agent_setup();
+
+  dout(0) << __func__ << " pool changed " << dendl;
+  if (pool.info.manifest_mode == pg_pool_t::MANIFEST_DEDUP_WRITEBACK) {
+    start_dedup_agent();
+  }
 }
 
 // clear state.  called on recovery completion AND cancellation.
@@ -14576,6 +14594,11 @@ bool PrimaryLogPG::agent_work(int start_max, int agent_flush_quota)
       continue;
     }
 
+    if (pool.info.manifest_mode == pg_pool_t::MANIFEST_DEDUP_WRITEBACK) {
+      if (!obc->obs.oi.has_manifest()) {
+	continue;
+      }
+    }
 #if 0
     // be careful flushing omap to an EC pool.
     if (!base_pool->supports_omap() &&
@@ -14878,15 +14901,20 @@ bool PrimaryLogPG::agent_maybe_evict(ObjectContextRef& obc, bool after_flush)
     obs.oi.new_object();
     
     for (auto &p : obs.oi.manifest.chunk_map) {
-      p.second.flags = chunk_info_t::FLAG_CLEAN;
+      p.second.flags = chunk_info_t::FLAG_MISSING;
     }
 
     if (obc->obs.oi.is_omap())
       ctx->delta_stats.num_objects_omap--;
     ctx->delta_stats.num_evict++;
     ctx->delta_stats.num_evict_kb += SHIFT_ROUND_UP(obc->obs.oi.size, 10);
+#if 0
     if (obc->obs.oi.is_dirty())
       --ctx->delta_stats.num_objects_dirty;
+#endif
+    ctx->at_version = get_next_version();
+    obs.oi.clear_flag(object_info_t::FLAG_DIRTY);
+    --ctx->delta_stats.num_objects_dirty;
     finish_ctx(ctx.get(), pg_log_entry_t::MODIFY, false);
   } else {
   int r = _delete_oid(ctx.get(), true, false);
