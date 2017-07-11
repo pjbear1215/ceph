@@ -3115,6 +3115,7 @@ struct C_DedupWrite_Commit : public Context {
   uint64_t real_length;
   ObjectOperation *o_op;
   ObjectContextRef obc;
+  map<uint64_t, hobject_t> modified_chunks;
   C_DedupWrite_Commit(PrimaryLogPG *p, hobject_t o, epoch_t lpr,
                       const PrimaryLogPG::ProxyWriteOpRef& pw)
     : pg(p), oid(o), last_peering_reset(lpr),
@@ -3135,12 +3136,33 @@ struct C_DedupWrite_Commit : public Context {
     }
     
     pg->update_dedup_meta(obc, real_offset);
+    if (modified_chunks.size() > 0) {
+      assert(obc);
+      pg->dec_dedup_ref(obc, modified_chunks);
+    }
     pg->unlock();
     if (o_op) {
       delete o_op;
     }
   }
 };
+
+void PrimaryLogPG::dec_dedup_ref(ObjectContextRef obc, map<uint64_t, hobject_t> &modified_chunks) {
+  for (auto &p : modified_chunks) {
+    ceph_tid_t tid;
+    object_locator_t oloc(p.second);
+    ObjectOperation obj_op;
+    obj_op.add_op(CEPH_OSD_OP_DECREF);
+    SnapContext snapc;
+    unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY | 
+		     CEPH_OSD_FLAG_RWORDERED;
+
+    tid = osd->objecter->mutate(
+      p.second.oid, oloc, obj_op, snapc,
+      ceph::real_clock::from_ceph_timespec(obc->obs.oi.mtime),
+      flags, NULL);
+  }
+}
 
 void PrimaryLogPG::update_dedup_meta(ObjectContextRef obc, uint64_t offset) {
   OpContextUPtr ctx = simple_opc_create(obc);
@@ -3541,6 +3563,11 @@ ceph_tid_t PrimaryLogPG::do_dedup_write(string oid_fp, OpRequestRef op, ObjectCo
   fin->real_length = real_length;
   fin->o_op = o_op;
   fin->obc = obc;
+
+  if (obc->obs.oi.manifest.chunk_map[chunk_index].oid != hobject_t() && 
+      obc->obs.oi.manifest.chunk_map[chunk_index].oid.oid != object_t(oid_fp)) {
+    fin->modified_chunks[chunk_index] = obc->obs.oi.manifest.chunk_map[chunk_index].oid; 
+  }
 
   C_GatherBuilder gather(g_ceph_context);
   gather.set_finisher(new C_OnFinisher(fin,
@@ -7072,7 +7099,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  result = -ENOENT;
 	  break;
 	}
-	if (obs.oi.manifest.type != manifest_info_t::TYPE_REFERENCE_COUNT) {
+	if (obs.oi.manifest.type != object_manifest_t::TYPE_REFERENCE_COUNT) {
 	  assert(0);
 	  result = -EOPNOTSUPP;
 	  break;
@@ -10310,6 +10337,8 @@ struct C_Flush : public Context {
   epoch_t last_peering_reset;
   ceph_tid_t tid;
   utime_t start;
+  map<uint64_t, hobject_t> modified_chunks;
+  ObjectContextRef obc;
   C_Flush(PrimaryLogPG *p, hobject_t o, epoch_t lpr)
     : pg(p), oid(o), last_peering_reset(lpr),
       tid(0), start(ceph_clock_now())
@@ -10321,6 +10350,10 @@ struct C_Flush : public Context {
     if (last_peering_reset == pg->get_last_peering_reset()) {
       pg->finish_flush(oid, tid, r);
       pg->osd->logger->tinc(l_osd_tier_flush_lat, ceph_clock_now() - start);
+      if (modified_chunks.size() > 0) {
+	assert(obc);
+	pg->dec_dedup_ref(obc, modified_chunks);
+      }
     }
     pg->unlock();
   }
@@ -10579,9 +10612,7 @@ int PrimaryLogPG::do_manifest_flush(OpRequestRef op, ObjectContextRef obc,
       return r;
     }
 
-    if (!chunks_data.length()) {
-      assert(0);
-    }
+    assert(chunks_data.length() != 0);
 
     uint64_t s_offset = cursor;
     while (s_offset < cursor+read_ahead) {
@@ -10611,6 +10642,14 @@ int PrimaryLogPG::do_manifest_flush(OpRequestRef op, ObjectContextRef obc,
       cnf->do_cnf(cnf_buf);
 
       string oid_fp = cnf->get_fp_to_string(0);
+
+      /* */
+      if (oi.manifest.chunk_map[s_offset].oid != hobject_t() && 
+	  oi.manifest.chunk_map[s_offset].oid.oid != object_t(oid_fp)) {
+	fin->modified_chunks[s_offset] = oi.manifest.chunk_map[s_offset].oid; 
+      }
+      fin->obc = obc;
+
       oi.manifest.chunk_map[s_offset].oid = manifest->chunk_map[0].oid;
       oi.manifest.chunk_map[s_offset].oid.oid = object_t(oid_fp);
       tgt_soid = oi.manifest.chunk_map[s_offset].oid;
@@ -10628,7 +10667,7 @@ int PrimaryLogPG::do_manifest_flush(OpRequestRef op, ObjectContextRef obc,
       }
 
       unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY | 
-		       CEPH_OSD_FLAG_RWORDERED ;
+		       CEPH_OSD_FLAG_RWORDERED;
       tid = osd->objecter->mutate(
 	tgt_soid.oid, oloc, obj_op, snapc,
 	ceph::real_clock::from_ceph_timespec(oi.mtime),

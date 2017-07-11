@@ -1399,6 +1399,7 @@ protected:
 			uint64_t &d_offset, uint64_t &d_length,
 			uint64_t &s_offset);
   void update_dedup_meta(ObjectContextRef obc, uint64_t offset);
+  void dec_dedup_ref(ObjectContextRef obc, map<uint64_t, hobject_t> &modified_chunks);
   bool need_bypass_oid(string oid_name);
   void start_dedup_agent();
 
