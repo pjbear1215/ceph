@@ -2850,6 +2850,10 @@ struct C_DedupReadWrite : public Context {
   int op_index;
   uint64_t chunk_index;
   ObjectContextRef obc;
+  uint64_t log_offset;
+  uint64_t ori_offset;
+  uint64_t ori_length;
+  bufferlist list;
   C_DedupReadWrite(PrimaryLogPG *p, hobject_t o, epoch_t lpr,
              const PrimaryLogPG::ProxyReadOpRef& prd)
     : pg(p), oid(o), last_peering_reset(lpr),
@@ -2883,10 +2887,15 @@ struct C_DedupReadWrite : public Context {
                       << " data lengh: " << o_op->ops[r_index].outdata.length()
                       << " result: " << r <<  "real_offset: " << real_offset
 		      << " resl_lenght: " << real_length << dendl;
-      pg->do_dedup_overwrite(prdop->op, obc, op_index, chunk_index, o_op->ops[r_index].outdata,
-			     real_offset, real_length);
-
-      pg->finish_proxy_read(oid, tid, r);
+      if (prdop) {
+	pg->do_dedup_overwrite(prdop->op, obc, op_index, chunk_index, o_op->ops[r_index].outdata,
+			       real_offset, real_length);
+	pg->finish_proxy_read(oid, tid, r);
+      } else {
+	/* log case ? */
+	pg->do_dedup_overwrite(obc, chunk_index, o_op->ops[r_index].outdata,
+			       real_offset, real_length, list, ori_offset, ori_length, log_offset);
+      }
   }
 };
 
@@ -3140,6 +3149,49 @@ struct C_DedupWrite_Commit : public Context {
       assert(obc);
       pg->dec_dedup_ref(obc, modified_chunks);
     }
+
+    pg->unlock();
+    if (o_op) {
+      delete o_op;
+    }
+  }
+};
+
+struct C_DedupWrite_Log : public Context {
+  PrimaryLogPGRef pg;
+  hobject_t oid; // ori oid
+  epoch_t last_peering_reset;
+  ceph_tid_t tid;
+  string oid_fp;
+  int mode;
+  uint64_t real_offset;
+  uint64_t real_length;
+  uint64_t log_offset;
+  ObjectOperation *o_op;
+  ObjectContextRef obc;
+  ObjectContextRef log_obc;
+  map<uint64_t, hobject_t> modified_chunks;
+  C_DedupWrite_Log(PrimaryLogPG *p, hobject_t o, epoch_t lpr)
+    : pg(p), oid(o), last_peering_reset(lpr),
+      tid(0), mode(0), real_offset(0),
+      real_length(0), o_op(NULL)
+  { }
+  void finish(int r) {
+    lgeneric_dout(g_ceph_context, 0) << __func__ << " " << __LINE__ << " C_DedupWrite_Log oid: " << oid
+                    << " tid: " << tid << " r: " << r 
+		    << " log offset: " << log_offset << dendl;
+    pg->lock();
+    
+#if 0
+    if (last_peering_reset == pg->get_last_peering_reset()) {
+      //pg->finish_proxy_write(oid, tid, r);
+    }
+#endif
+    
+    assert(log_obc);
+    pg->update_dedup_log_meta(log_obc, log_offset, chunk_info_t::FLAG_DELETED);
+    pg->update_dedup_meta(obc, real_offset);
+
     pg->unlock();
     if (o_op) {
       delete o_op;
@@ -3162,6 +3214,17 @@ void PrimaryLogPG::dec_dedup_ref(ObjectContextRef obc, map<uint64_t, hobject_t> 
       ceph::real_clock::from_ceph_timespec(obc->obs.oi.mtime),
       flags, NULL);
   }
+}
+
+void PrimaryLogPG::update_dedup_log_meta(ObjectContextRef obc, uint64_t offset, uint64_t flags) {
+  OpContextUPtr ctx = simple_opc_create(obc);
+  ObjectState& obs = ctx->new_obs;
+  ctx->at_version = get_next_version();
+  utime_t now = ceph_clock_now();
+  ctx->mtime = now;
+  obs.oi.manifest.chunk_map[offset].flags = flags;
+  finish_ctx(ctx.get(), pg_log_entry_t::MODIFY);
+  simple_opc_submit(std::move(ctx));
 }
 
 void PrimaryLogPG::update_dedup_meta(ObjectContextRef obc, uint64_t offset) {
@@ -3396,6 +3459,58 @@ void PrimaryLogPG::get_dedup_offset(uint64_t ori_offset, uint64_t ori_length,
   }
 }
 
+bool PrimaryLogPG::do_dedup_full_read_and_write(ObjectContextRef obc,
+                                                uint64_t chunk_index, uint64_t real_offset, uint64_t real_length,
+						bufferlist &list, uint64_t ori_offset, uint64_t ori_length, 
+						uint64_t log_offset)
+{
+  object_manifest_t *manifest = &obc->obs.oi.manifest;
+  hobject_t soid = manifest->chunk_map[chunk_index].oid;
+  object_locator_t oloc(soid);
+
+  unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY | CEPH_OSD_FLAG_RWORDERED;
+
+  dout(0) << __func__ << " " << __LINE__ 
+          << " chunk_index: " << chunk_index
+          << " real_offset: " << real_offset
+          << " real_length: " << real_length << dendl;
+
+  ObjectOperation *o_op = new ObjectOperation;
+  assert(o_op);
+  OSDOp &osd_op = o_op->add_op(CEPH_OSD_OP_READ);
+  osd_op.op.extent.offset = 0;
+  osd_op.op.extent.length = real_length;
+
+  C_DedupReadWrite *fin = new C_DedupReadWrite(this, obc->obs.oi.soid, get_last_peering_reset(),
+                                     NULL);
+  fin->real_offset = real_offset;
+  fin->real_length = real_length;
+  fin->o_op = o_op;
+  fin->chunk_index = chunk_index;
+  fin->obc = obc;
+  fin->log_offset = log_offset;
+  fin->ori_offset = ori_offset;
+  fin->ori_length = ori_length;
+  fin->list = list;
+
+  ObjectOperation obj_op;
+  obj_op.dup(o_op->ops);
+
+  ceph_tid_t tid = osd->objecter->read(
+    soid.oid, oloc, obj_op,
+    snapid_t(), NULL,
+    flags, new C_OnFinisher(fin, &osd->objecter_finisher),
+    NULL);
+
+  fin->tid = tid;
+
+  dout(15) << __func__ << " " << __LINE__ << " fp oid: " << soid.oid.name
+          << " tid: " << tid << " ops size: "
+          << o_op->ops.size() << dendl;
+
+  return true;
+}
+
 bool PrimaryLogPG::do_dedup_full_read_and_write(OpRequestRef op, ObjectContextRef obc, int op_index,
                                                 uint64_t chunk_index, uint64_t real_offset, uint64_t real_length)
 {
@@ -3527,6 +3642,126 @@ void PrimaryLogPG::do_dedup_overwrite(OpRequestRef op, ObjectContextRef obc, int
           << " real_length: " << real_length
           << dendl;
   write_buf.clear();
+}
+
+void PrimaryLogPG::do_dedup_overwrite(ObjectContextRef obc, int chunk_index, 
+				      bufferlist &buf, uint64_t real_offset, uint64_t real_length, 
+				      bufferlist& list, uint64_t ori_offset, uint64_t ori_length, 
+				      uint64_t log_offset)
+{
+  uint64_t chunk_length = obc->obs.oi.manifest.chunk_length;
+  string oid_fp;
+
+  ChunknFPRef cnf(std::make_shared<ChunknFP>(FIXED_CHUNK, chunk_length, FP_SHA1));
+  uint64_t t_offset = 0, t_length = 0, s_offset = 0;
+
+  get_dedup_offset(ori_offset, ori_length, real_offset, real_length,
+                    t_offset, t_length, s_offset);
+
+  dout(0) << __func__ << " " << __LINE__ << " ori_offset: " << ori_offset
+          << " ori_length: " << ori_length << " t_offset: " << t_offset << " t_length: "
+          << t_length << " s_offset: " << s_offset  << " real_offset: " << real_offset
+          << " real_length: " << real_length << dendl;
+  
+  bufferlist write_buf;
+
+  if (buf.length() == chunk_length) {
+    write_buf = buf;
+  } else {
+    assert(0);
+  }
+
+
+  if (t_length != list.length()) {
+    assert(0);
+  }
+
+  write_buf.copy_in(t_offset, t_length, list.c_str());
+  cnf->do_cnf(write_buf);
+  oid_fp = cnf->get_fp_to_string(0);
+
+  ObjectOperation * obj_op = new ObjectOperation;
+  assert(obj_op);
+  OSDOp &osd_op = obj_op->add_op(CEPH_OSD_OP_WRITEINCREF);
+#if 0
+  if (real_offset >= ori_offset) {
+    osd_op.op.extent.offset = 0;
+  } else {
+    osd_op.op.extent.offset = ori_offset % chunk_length;
+  }
+  if (real_offset + real_length < ori_offset + ori_length) {
+    osd_op.op.extent.length = write_buf.length();
+  } else {
+    osd_op.op.extent.length = (ori_offset+ori_length) - real_offset;
+  }
+#endif
+  osd_op.op.extent.offset = 0;
+  osd_op.op.extent.length = write_buf.length();
+  osd_op.indata.append(write_buf);
+
+  /* real_offset is chunk_index ! */
+  obc->obs.oi.manifest.chunk_map[chunk_index].oid = obc->obs.oi.manifest.chunk_map[0].oid;
+  obc->obs.oi.manifest.chunk_map[chunk_index].oid.oid = object_t(oid_fp);
+  if (obc->obs.oi.manifest.chunk_map[chunk_index].length < (real_offset+real_length-chunk_index)) {
+    obc->obs.oi.manifest.chunk_map[chunk_index].length = real_offset+real_length-chunk_index;
+  }
+
+  do_dedup_write(oid_fp, obc, 0, chunk_index, obj_op, real_offset, real_length, log_offset);
+  dout(0) << __func__ << " " << __LINE__ << " oid_fp: " << oid_fp << " extent.offset: "
+          << " write buf size: " << write_buf.length() << " real_offset: " << real_offset
+          << " real_length: " << real_length
+          << dendl;
+  write_buf.clear();
+}
+
+ceph_tid_t PrimaryLogPG::do_dedup_write(string oid_fp, ObjectContextRef obc, int op_index,
+					uint64_t chunk_index, ObjectOperation * o_op, uint64_t real_offset, 
+					uint64_t real_length, uint64_t log_offset)
+{
+  SnapContext snapc;
+  object_t oid(oid_fp);
+  assert(o_op);
+  assert(o_op->ops.size());
+
+  hobject_t ori_soid = obc->obs.oi.soid;
+  hobject_t tgt_soid = obc->obs.oi.manifest.chunk_map[chunk_index].oid;
+  object_locator_t cas_oloc(tgt_soid);
+
+  unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY | CEPH_OSD_FLAG_RWORDERED;
+
+  /* obj_op will be deleted... */
+  ObjectOperation obj_op;
+  obj_op.dup(o_op->ops);
+
+  /* need to be fixed */
+  C_DedupWrite_Log *fin = new C_DedupWrite_Log(
+      this, ori_soid, get_last_peering_reset());
+  fin->oid_fp = oid_fp;
+  fin->real_offset = real_offset;
+  fin->real_length = real_length;
+  fin->o_op = o_op;
+  fin->obc = obc;
+
+  if (obc->obs.oi.manifest.chunk_map[chunk_index].oid != hobject_t() && 
+      obc->obs.oi.manifest.chunk_map[chunk_index].oid.oid != object_t(oid_fp)) {
+    fin->modified_chunks[chunk_index] = obc->obs.oi.manifest.chunk_map[chunk_index].oid; 
+  }
+
+  C_GatherBuilder gather(g_ceph_context);
+  gather.set_finisher(new C_OnFinisher(fin,
+                                       &osd->objecter_finisher));
+
+  ceph_tid_t tid = osd->objecter->mutate(
+    tgt_soid.oid, cas_oloc, obj_op, snapc,
+    ceph::real_clock::from_ceph_timespec(obc->obs.oi.mtime),
+    flags, gather.new_sub());
+
+  fin->tid = tid;
+  dout(0) << __func__ << " " << __LINE__ << " fp oid: " << oid_fp
+          << " taget oid: " << tgt_soid << " original oid: " << ori_soid << " tid: " << tid
+          << dendl;
+  gather.activate();
+  return tid;
 }
 
 ceph_tid_t PrimaryLogPG::do_dedup_write(string oid_fp, OpRequestRef op, ObjectContextRef obc, int op_index,
@@ -3819,6 +4054,104 @@ void PrimaryLogPG::start_dedup_agent()
 
   agent_choose_mode();
 }                                                                  
+
+bool PrimaryLogPG::can_do_write_log(OpContext *ctx, ObjectState& obs, object_info_t& oi, OSDOp& osd_op,
+				    ceph_osd_op& op)
+{
+  if (pool.info.manifest_mode != pg_pool_t::MANIFEST_DEDUP_LOGCACHE) {
+    return false;
+  }
+  /* check if the data is cold */
+
+  /* sequential data ? */
+  uint64_t chunk_length = pool.info.dedup_chunk_size;
+  if ((op.extent.length % chunk_length) == 0 && op.extent.length > (chunk_length*2)) {
+    return true;
+  }
+  return false;
+}
+
+
+void PrimaryLogPG::do_write_log(OpContext *ctx, ObjectState& obs, object_info_t& oi, OSDOp& osd_op,
+				ceph_osd_op& op)
+{
+  uint64_t chunk_length = pool.info.dedup_chunk_size;
+  assert(chunk_length);
+  if (pool.info.log_oid == hobject_t()) {
+    assert(0);
+  }
+  ObjectContextRef log_obc = get_object_context(pool.info.log_oid, false);
+  assert(log_obc);
+  OpContextUPtr log_ctx = simple_opc_create(log_obc);
+  assert(op.extent.length);
+  PGTransaction *log_t = log_ctx->op_t.get();
+  ObjectState& log_obs = log_ctx->new_obs;
+  /* find out the last element */
+  /* fix me: need the lock to protect log */
+  uint64_t new_offset = log_obc->obs.oi.manifest.chunk_map.rbegin()->first +
+			  log_obc->obs.oi.manifest.chunk_map.rbegin()->second.offset;
+  log_obs.oi.manifest.chunk_map[new_offset].oid = oi.soid;
+  log_obs.oi.manifest.chunk_map[new_offset].length = op.extent.length;
+  log_obs.oi.manifest.chunk_map[new_offset].offset = op.extent.offset;
+  log_t->write(
+    pool.info.log_oid, new_offset, op.extent.length, osd_op.indata, op.flags);
+
+  simple_opc_submit(std::move(log_ctx));
+  dout(0) << __func__ << " log-cache oid: " << oi.soid.oid << " new offest: " << new_offset
+	  << " offset: " << op.extent.offset 
+	  << " length: " << op.extent.length 
+	  << " oi.size: " << oi.size << dendl;
+
+  if (op.extent.offset == 0 && op.extent.length >= oi.size)
+    obs.oi.set_data_digest(osd_op.indata.crc32c(-1));
+  else if (op.extent.offset == oi.size && obs.oi.is_data_digest())
+    obs.oi.set_data_digest(osd_op.indata.crc32c(obs.oi.data_digest));
+  else
+    obs.oi.clear_data_digest();
+
+  /* mark this chunk in the log */
+  /* only for fixed chunk size */ 
+  uint64_t chunked_offset = 0, chunked_length = 0, padding = 0;
+  uint64_t offset = op.extent.offset;
+  uint64_t length = op.extent.length;
+
+  if (offset + length > oi.size) {
+    uint64_t new_size = offset + length;
+    ctx->delta_stats.num_bytes -= oi.size;
+    ctx->delta_stats.num_bytes += new_size;
+    dout(0) << __func__ << " new size: " << new_size << " oi.size: " << oi.size << dendl;
+    oi.size = new_size;
+  }
+
+  /* | padding | data | */
+  padding = offset % chunk_length;
+  chunked_offset = offset - padding;
+
+  /* | data | padding | */
+  padding = (offset + length) % chunk_length;
+  if (padding) {
+    padding = chunk_length - padding;
+  }
+  chunked_length = (offset + length + padding) - chunked_offset;
+  /* aligned write for dedup */
+  for (uint64_t t_cursor = chunked_offset; t_cursor < (chunked_offset+chunked_length);
+       t_cursor += chunk_length) {
+    oi.manifest.chunk_map[t_cursor].flags = chunk_info_t::FLAG_IN_LOG;
+    if (oi.manifest.chunk_map[t_cursor].length < chunk_length) {
+      if ((offset + length >= t_cursor + chunk_length) && (length >= chunk_length)) {
+	oi.manifest.chunk_map[t_cursor].length = chunk_length;
+      } else if (offset + length < t_cursor + chunk_length) {
+	oi.manifest.chunk_map[t_cursor].length = (offset+length) - t_cursor;
+      }
+    }
+    dout(0) << __func__ << " in log offset: " << t_cursor << " length: " 
+	    << oi.manifest.chunk_map[t_cursor].length << dendl;
+  }
+
+  ctx->delta_stats.num_wr++;
+  ctx->delta_stats.num_wr_kb += SHIFT_ROUND_UP(length, 10);
+  ctx->modify = true;
+}
 
 void PrimaryLogPG::finish_proxy_write(hobject_t oid, ceph_tid_t tid, int r)
 {
@@ -5318,7 +5651,15 @@ void PrimaryLogPG::maybe_create_new_object(
       switch (pool.info.manifest_mode) {
 	case pg_pool_t::MANIFEST_DEDUP_PROXY:
 	case pg_pool_t::MANIFEST_DEDUP_WRITEBACK: 
+	case pg_pool_t::MANIFEST_DEDUP_LOGCACHE: 
 	  {
+	    if (pool.info.log_oid == hobject_t()) {
+	      dout(0) << __func__ << " create a new log ... " << dendl;
+	      obs.oi.set_flag(object_info_t::FLAG_MANIFEST);
+	      obs.oi.manifest.type = object_manifest_t::TYPE_LOG;
+	      pool.info.log_oid = obs.oi.soid;
+	      break;
+	    }
 	    obs.oi.set_flag(object_info_t::FLAG_MANIFEST);
 	    obs.oi.manifest.type = object_manifest_t::TYPE_CHUNKED;
 	    if (pool.info.dedup_chunk_size == 0) {
@@ -5354,7 +5695,17 @@ void PrimaryLogPG::maybe_create_new_object(
     switch (pool.info.manifest_mode) {
       case pg_pool_t::MANIFEST_DEDUP_PROXY:
       case pg_pool_t::MANIFEST_DEDUP_WRITEBACK:
+      case pg_pool_t::MANIFEST_DEDUP_LOGCACHE: 
 	if (!obs.oi.test_flag(object_info_t::FLAG_MANIFEST)) {
+
+	  if (pool.info.log_oid == hobject_t()) {
+	    dout(0) << __func__ << " create a new log ... " << dendl;
+	    obs.oi.set_flag(object_info_t::FLAG_MANIFEST);
+	    obs.oi.manifest.type = object_manifest_t::TYPE_LOG;
+	    pool.info.log_oid = obs.oi.soid;
+	    break;
+	  }
+
 	  obs.oi.set_flag(object_info_t::FLAG_MANIFEST);
 	  obs.oi.manifest.type = object_manifest_t::TYPE_CHUNKED;
 	  if (pool.info.dedup_chunk_size == 0) {
@@ -6579,6 +6930,22 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 
 	maybe_create_new_object(ctx);
 
+	if (pool.info.manifest_mode == pg_pool_t::MANIFEST_DEDUP_LOGCACHE) {
+	  /* check if log-write is needed */
+	  /* 1. Does the object exist in the cache ?
+	   * 2. exist in the log ?
+	   * 3. exist in cas pool ?
+	   */
+	  if (can_do_write_log(ctx, obs, oi, osd_op, op)) {
+	    do_write_log(ctx, obs, oi, osd_op, op); 
+	    break;
+	  }
+#if 0
+	    write_update_size_and_usage(ctx->delta_stats, oi, ctx->modified_ranges,
+					op.extent.offset, op.extent.length);
+#endif
+	}
+
 	if (op.extent.length == 0) {
 	  if (op.extent.offset > oi.size) {
 	    t->truncate(
@@ -6622,6 +6989,22 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 
 	if (pool.info.has_flag(pg_pool_t::FLAG_WRITE_FADVISE_DONTNEED))
 	  op.flags = op.flags | CEPH_OSD_OP_FLAG_FADVISE_DONTNEED;
+
+	if (pool.info.manifest_mode == pg_pool_t::MANIFEST_DEDUP_LOGCACHE) {
+	  /* check if log-write is needed */
+	  /* 1. Does the object exist in the cache ?
+	   * 2. exist in the log ?
+	   * 3. exist in cas pool ?
+	   */
+	  if (can_do_write_log(ctx, obs, oi, osd_op, op)) {
+	    do_write_log(ctx, obs, oi, osd_op, op); 
+	    break;
+	  }
+#if 0
+	    write_update_size_and_usage(ctx->delta_stats, oi, ctx->modified_ranges,
+					op.extent.offset, op.extent.length);
+#endif
+	}
 
 	maybe_create_new_object(ctx);
 	if (pool.info.require_rollback()) {
@@ -10564,6 +10947,267 @@ int PrimaryLogPG::start_flush(
   return -EINPROGRESS;
 }
 
+#if 0
+struct chunk_buf {
+  uint64_t length;
+  bufferlist list;
+};
+
+void PrimaryLogPG::manifest_flush_dirty_object(map<hobject_t, boost::tuple<uint64_t, uint64_t>> &dirty_objects)
+{
+
+}
+
+void PrimaryLogPG::manifest_insert_dirty_object(map<hobject_t, map<uint64_t, struct chunk_buf>> &dirty_objects,
+						 hobject_t obj, uint64_t offset, uint64_t length, bufferlist &list) 
+{
+  /* search overlapped area */
+  //map<hobject_t ,map<uint64_t, uint64_t>>:: dirty_objects.find(obj);
+  auto p = dirty_objects.find(obj);
+  if (p == dirty_objects.end()) {
+    return;
+  }
+  
+  for (auto q = p->second.begin(); q != p->second.end(); ++q) {
+    /* merge! */
+    uint64_t old_offset = q->first, old_length = q->second.length;
+    uint64_t new_offset, new_length;
+    dout(0) << __func__ << " before old offset: " << old_offset 
+	    << " old length: " << old_length << " new offset: " << offset
+	    << " new length: " << length << dendl;
+    if (old_offset >= offset && old_offset < offset+length) {
+      new_offset = offset;
+      struct chunk_buf c_buf;
+      if (offset+length > old_offset+old_length) {
+	new_length = offset+length; 
+	c_buf.list = list;
+      } else {
+	bufferlist tmp_list;
+	new_length = old_offset+old_length+(q->first-offset); 
+	bufferptr bptr(new_length);
+	tmp_list.push_back(std::move(bptr));
+	tmp_list.copy_in(
+	c_buf.list = list;
+      }
+      c_buf.length = new_length;
+      dirty_objects[obj][new_offset] = c_buf;
+    } else if ((old_offset < offset) && (old_offset+old_length >= offset)) {
+      new_offset = old_offset;
+      if (offset+length > old_offset+old_length) {
+	new_length = offset+length; 
+      } else {
+	new_length = old_offset+old_length; 
+      }
+    }
+
+  }
+  
+}
+#endif
+
+void PrimaryLogPG::do_manifest_flush_partial(OpRequestRef op, ObjectContextRef obc, uint64_t offset, 
+					    uint64_t length, bufferlist &list, uint64_t log_offset, 
+					    uint64_t op_index)
+{
+  /* write (only for fiexd chunk)*/
+  uint64_t chunked_offset, chunked_length, padding, chunk_length;
+  bool no_index = false;
+  object_manifest_t *manifest = &obc->obs.oi.manifest;
+
+  chunk_length = obc->obs.oi.manifest.chunk_length;
+  /* | padding | data | */
+  padding = offset % chunk_length;
+  chunked_offset = offset - padding;
+
+  /* | data | padding | */
+  padding = (offset + length) % chunk_length;
+  if (padding) {
+    padding = chunk_length - padding;
+  }
+  chunked_length = (offset + length + padding) - chunked_offset;
+
+  map<uint64_t, chunk_info_t>::iterator iter = manifest->chunk_map.find(chunked_offset);
+  /* no index */
+  if (iter == manifest->chunk_map.end()) {
+    manifest->chunk_map[offset].length = manifest->chunk_map[0].length;
+    chunk_length = obc->obs.oi.manifest.chunk_map[0].length;
+    no_index = true;
+  } 
+  dout(0) << __func__ << " chunked_offset: " << chunked_offset << " chunked_length: " << chunked_length
+	  << " no_index?: " << no_index << dendl;
+
+  /* aligned write for dedup */
+  for (uint64_t t_cursor = chunked_offset; t_cursor < (chunked_offset+chunked_length);
+       t_cursor += chunk_length) {
+    //uint64_t buf_offset, buf_length, s_offset;
+    dout(0) << __func__ << " t_cursor: " << t_cursor << " chunk_length: " << chunk_length
+	    << dendl;
+    map<uint64_t, chunk_info_t>::iterator iter = manifest->chunk_map.find(t_cursor);
+    /* no index */
+    if (iter == manifest->chunk_map.end()) {
+      no_index = true;
+    } 
+    /* | data | = | data 	       |
+		  | chunk_length   |	   
+       | data | = | data | no data | */
+    if (no_index || ((t_cursor >= offset) &&   
+		     (t_cursor+chunk_length <= obc->obs.oi.manifest.ori_size ))) {
+      bufferptr tmp_buf(chunk_length);
+      tmp_buf.zero();
+      bufferlist write_buf;
+      write_buf.append(tmp_buf);
+      if (op) { 
+	do_dedup_overwrite(op, obc, op_index, t_cursor, 
+			   write_buf, t_cursor, chunk_length);
+      } else {
+	do_dedup_overwrite(obc, t_cursor, 
+			   write_buf, t_cursor, chunk_length, list, offset, length, log_offset);
+      }
+    } else {
+      map<uint64_t, chunk_info_t>::iterator iter = manifest->chunk_map.find(chunked_offset);
+      if (iter == manifest->chunk_map.end()) {
+	assert(0);
+      }
+      if (op) {
+	do_dedup_full_read_and_write(op, obc, op_index, t_cursor, t_cursor, chunk_length);
+      } else {
+	do_dedup_full_read_and_write(obc, t_cursor, t_cursor, chunk_length, list,
+				     offset, length, log_offset);
+      }
+    }
+  }
+}
+
+int PrimaryLogPG::manifest_dedup_log_flush() 
+{
+  if (pool.info.manifest_mode != pg_pool_t::MANIFEST_DEDUP_LOGCACHE) {
+    assert(0 == "not logcache mode");
+  }
+  if (pool.info.log_oid == hobject_t()) {
+    assert(0 == "log oid is null");
+  }
+  ObjectContextRef log_obc = get_object_context(pool.info.log_oid, false);
+
+  /* read the log */
+  uint64_t cursor = 0, read_ahead = 0, chunk_length = pool.info.dedup_chunk_size; 
+  hobject_t& soid = log_obc->obs.oi.soid;
+  cursor = log_obc->obs.oi.manifest.start_offset;
+  object_info_t& oi = log_obc->obs.oi;
+
+  while (cursor < oi.size) {
+    /* determine read-ahead size */
+    map<uint64_t, chunk_info_t>::iterator p = log_obc->obs.oi.manifest.chunk_map.find(cursor);
+    dout(0) << __func__ << " chunk offset: " << p->first << " info: " << p->second << dendl;
+    for (;p != oi.manifest.chunk_map.end(); ++p) {
+      if (p->second.flags == chunk_info_t::FLAG_DIRTY) {
+	read_ahead += p->second.length;
+      } else {
+	break;
+      }
+      if (read_ahead > 4194304) {
+	break;
+      }
+    }
+
+    bufferlist chunks_data;
+    int r = pgbackend->objects_read_sync(
+	soid, cursor, read_ahead, 0, &chunks_data);
+    if (r < 0) {
+      dout(0) << __func__ << " read fail " << " offset: " << cursor
+	      << " read_ahead: " << read_ahead << " r: " << r << dendl;
+      assert(0);
+      return r;
+    }
+
+    assert(chunks_data.length() != 0);
+
+    uint64_t s_offset = cursor;
+    while (s_offset < cursor+read_ahead) {
+      uint64_t tgt_length, tgt_offset;
+      hobject_t tgt_soid;
+      map<uint64_t, chunk_info_t>::iterator iter = oi.manifest.chunk_map.find(s_offset);
+      if (iter == oi.manifest.chunk_map.end()) {
+	assert(0);	
+      }
+      tgt_length = iter->second.length;
+      tgt_soid = iter->second.oid;
+      tgt_offset = iter->second.offset;
+      dout(0) << __func__ << " s_length: " << tgt_length << " s_offset: " << s_offset 
+	      << " chunk_length: " << chunk_length << dendl;
+      /* this chunk is overwritten */
+      if (iter->second.flags == chunk_info_t::FLAG_DELETED) {
+	continue;
+      }
+
+      //oi.manifest.chunk_map[s_offset].flags = chunk_info_t::FLAG_DELETED;
+      ObjectContextRef obc = get_object_context(pool.info.log_oid, false);
+      assert(obc);
+      bufferlist list;
+      bufferptr tmp_buf(tgt_length);
+      list.append(tmp_buf);
+      list.copy_in(0, tgt_length, chunks_data.c_str()+s_offset);
+      do_manifest_flush_partial(NULL, obc, iter->second.offset, iter->second.length, 
+				list, s_offset, -1);
+
+      dout(0) << __func__ << " " << __LINE__ << " tgt offset: "
+	      << tgt_offset << " tgt len: " << tgt_length << " oid: " << tgt_soid.oid 
+	      << " ori oid: " << soid.oid.name << dendl;
+
+      s_offset += tgt_length;
+    }
+    cursor += read_ahead;
+  }
+}
+
+#if 0
+      map<hobject_t, boost::tuple<uint64_t, uint64_t>> dirty_objects;
+      manifest_insert_dirty_object(dirty_objects, iter->second.oid, 
+				   iter->second.offset, iter->second.length);
+      manifest_flush_dirty_object(dirty_objects);
+#endif
+
+#if 0
+      ChunknFPRef cnf(std::make_shared<ChunknFP>(FIXED_CHUNK, chunk_length, FP_SHA1));
+      bufferptr tmp_chunk_buf(chunk_length);
+      tmp_chunk_buf.zero();
+      bufferlist cnf_buf;
+      cnf_buf.append(tmp_chunk_buf);
+      cnf_buf.copy_in(oi.manifest.chunk_map[s_offset].offset % chunk_length, s_length, 
+		      chunks_data.c_str()+s_offset);
+      cnf->do_cnf(cnf_buf);
+
+      string oid_fp = cnf->get_fp_to_string(0);
+
+      /* */
+      if (oi.manifest.chunk_map[s_offset].oid != hobject_t() && 
+	  oi.manifest.chunk_map[s_offset].oid.oid != object_t(oid_fp)) {
+	fin->modified_chunks[s_offset] = oi.manifest.chunk_map[s_offset].oid; 
+      }
+      fin->obc = obc;
+
+      oi.manifest.chunk_map[s_offset].oid = manifest->chunk_map[0].oid;
+      oi.manifest.chunk_map[s_offset].oid.oid = object_t(oid_fp);
+      tgt_soid = oi.manifest.chunk_map[s_offset].oid;
+
+      object_locator_t oloc(tgt_soid);
+      ObjectOperation obj_op;
+      bufferlist write_buf;
+      bufferptr tmp_buf(s_length);
+      write_buf.append(tmp_buf);
+      write_buf.copy_in(0, s_length, chunks_data.c_str()+(s_offset-cursor));
+      if (soid.oid.name == tgt_soid.oid.name) {
+	obj_op.add_data(CEPH_OSD_OP_WRITEINCREF, s_offset, s_length, write_buf);
+      } else {
+	obj_op.add_data(CEPH_OSD_OP_WRITEINCREF, 0, s_length, write_buf);
+      }
+
+      unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY | 
+		       CEPH_OSD_FLAG_RWORDERED;
+      tid = osd->objecter->mutate(
+	tgt_soid.oid, oloc, obj_op, snapc,
+	ceph::real_clock::from_ceph_timespec(oi.mtime),
+	flags, gather.new_sub());
+#endif
 int PrimaryLogPG::do_manifest_flush(OpRequestRef op, ObjectContextRef obc,
                                     SnapContext &snapc, FlushOpRef fop)
 {

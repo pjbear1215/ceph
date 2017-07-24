@@ -1198,6 +1198,7 @@ struct pg_pool_t {
     MANIFEST_REDIRECT = 1,                 ///< 
     MANIFEST_DEDUP_PROXY = 2,                 ///< 
     MANIFEST_DEDUP_WRITEBACK = 3,                 ///< 
+    MANIFEST_DEDUP_LOGCACHE = 4,                 ///< 
   } manifest_mode_t;
   static const char *get_cache_mode_name(cache_mode_t m) {
     switch (m) {
@@ -1217,6 +1218,7 @@ struct pg_pool_t {
     case MANIFEST_REDIRECT: return "manifest_redirect";
     case MANIFEST_DEDUP_PROXY: return "manifest_dedup_proxy";
     case MANIFEST_DEDUP_WRITEBACK: return "manifest_dedup_writeback";
+    case MANIFEST_DEDUP_LOGCACHE: return "manifest_dedup_logcache";
     default: return "unknown";
     }
   }
@@ -1246,6 +1248,8 @@ struct pg_pool_t {
       return MANIFEST_DEDUP_PROXY;
     if (s == "manifest_dedup_writeback")
       return MANIFEST_DEDUP_WRITEBACK;
+    if (s == "manifest_dedup_logcache")
+      return MANIFEST_DEDUP_LOGCACHE;
     return (manifest_mode_t)-1;
   }
   const char *get_cache_mode_name() const {
@@ -1376,6 +1380,7 @@ public:
   manifest_mode_t manifest_mode;
   uint64_t dedup_chunk_size;
   int tgt_pool;
+  hobject_t log_oid;
 
 private:
   vector<uint32_t> grade_table;
@@ -4450,10 +4455,13 @@ struct chunk_info_t {
     FLAG_DIRTY = 1, 
     FLAG_MISSING = 2,
     FLAG_CLEAN = 4,
+    FLAG_DELETED = 5,
+    FLAG_IN_LOG = 6,
   };
   uint64_t length;
   hobject_t oid;
   uint64_t flags;   // FLAG_*
+  uint64_t offset;
 
   chunk_info_t() : length(0), flags(0) { }
 
@@ -4487,6 +4495,7 @@ struct object_manifest_t {
     TYPE_REDIRECT = 1, 
     TYPE_CHUNKED = 2, 
     TYPE_REFERENCE_COUNT = 3,
+    TYPE_LOG = 4,
   };
   uint8_t type;  // redirect, chunked, ...
   hobject_t redirect_target;
@@ -4494,6 +4503,8 @@ struct object_manifest_t {
   uint64_t ori_size;
   uint64_t chunk_length;
   uint64_t ref_cnt;
+  uint64_t start_offset;
+  uint64_t end_offset;
 
   object_manifest_t() : type(0) { }
   object_manifest_t(uint8_t type, const hobject_t& redirect_target) 
@@ -4510,6 +4521,9 @@ struct object_manifest_t {
   }
   bool is_ref_cnt() const {
     return type == TYPE_REFERENCE_COUNT;
+  }
+  bool is_log() const {
+    return type == TYPE_LOG;
   }
   static const char *get_type_name(uint8_t m) {
     switch (m) {

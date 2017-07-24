@@ -1575,6 +1575,7 @@ void pg_pool_t::encode(bufferlist& bl, uint64_t features) const
     ::encode(c, bl);
     ::encode(dedup_chunk_size, bl);
     ::encode(tgt_pool, bl);
+    ::encode(log_oid, bl);
   }
   ENCODE_FINISH(bl);
 }
@@ -1734,6 +1735,7 @@ void pg_pool_t::decode(bufferlist::iterator& bl)
     manifest_mode = (manifest_mode_t)v;
     ::decode(dedup_chunk_size, bl);
     ::decode(tgt_pool, bl);
+    ::decode(log_oid, bl);
   } else {
     manifest_mode = pg_pool_t::MANIFEST_NONE;
     dedup_chunk_size = 131072;
@@ -4948,10 +4950,11 @@ void watch_info_t::generate_test_instances(list<watch_info_t*>& o)
 
 void chunk_info_t::encode(bufferlist& bl) const
 {
-  ENCODE_START(1, 1, bl);
+  ENCODE_START(2, 1, bl);
   ::encode(length, bl);
   ::encode(oid, bl);
   ::encode(flags, bl);
+  ::encode(offset, bl);
   ENCODE_FINISH(bl);
 }
 
@@ -4961,6 +4964,9 @@ void chunk_info_t::decode(bufferlist::iterator& bl)
   ::decode(length, bl);
   ::decode(oid, bl);
   ::decode(flags, bl);
+  if (struct_v >= 2) {
+    ::decode(offset, bl);
+  }
   DECODE_FINISH(bl);
 }
 
@@ -4998,6 +5004,13 @@ void object_manifest_t::encode(bufferlist& bl) const
     case TYPE_REFERENCE_COUNT:
       ::encode(ref_cnt, bl);
       break;
+    case TYPE_LOG:
+      ::encode(chunk_map, bl);      
+      ::encode(ori_size, bl);      
+      ::encode(chunk_length, bl);      
+      ::encode(start_offset, bl);
+      ::encode(end_offset, bl);
+      break;
     default:
       ceph_abort();
   }
@@ -5020,6 +5033,13 @@ void object_manifest_t::decode(bufferlist::iterator& bl)
       break;
     case TYPE_REFERENCE_COUNT:
       ::decode(ref_cnt, bl);
+      break;
+    case TYPE_LOG:
+      ::decode(chunk_map, bl);      
+      ::decode(ori_size, bl);      
+      ::decode(chunk_length, bl);      
+      ::decode(start_offset, bl);
+      ::decode(end_offset, bl);
       break;
     default:
       ceph_abort();
@@ -5063,6 +5083,12 @@ ostream& operator<<(ostream& out, const object_manifest_t& om)
     out << " " << om.chunk_length;
   } else if (om.is_ref_cnt()) {
     out << " " << om.ref_cnt;
+  } else if (om.is_log()) {
+    out << " " << om.chunk_map;
+    out << " " << om.ori_size;
+    out << " " << om.chunk_length;
+    out << " " << om.start_offset;
+    out << " " << om.end_offset;
   }
   out << ")";
   return out;

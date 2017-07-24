@@ -1316,6 +1316,9 @@ protected:
   // manifest
   int do_manifest_flush(OpRequestRef op, ObjectContextRef obc,
 			SnapContext &snapc, FlushOpRef fop);
+  void do_manifest_flush_partial(OpRequestRef op, ObjectContextRef obc, uint64_t offset,
+				  uint64_t length, bufferlist &list, uint64_t log_offset,
+				  uint64_t op_index);
 
   /// @return false if clone is has been evicted
   bool is_present_clone(hobject_t coid);
@@ -1401,11 +1404,29 @@ protected:
   void update_dedup_meta(ObjectContextRef obc, uint64_t offset);
   void dec_dedup_ref(ObjectContextRef obc, map<uint64_t, hobject_t> &modified_chunks);
   bool need_bypass_oid(string oid_name);
+  void do_write_log(OpContext *ctx, ObjectState& obs, object_info_t& oi, OSDOp& osd_op,
+		    ceph_osd_op& op);
+  bool can_do_write_log(OpContext *ctx, ObjectState& obs, object_info_t& oi, OSDOp& osd_op, 
+			ceph_osd_op& op);
   void start_dedup_agent();
+  int manifest_dedup_log_flush();
+  void update_dedup_log_meta(ObjectContextRef obc, uint64_t offset, uint64_t flags);
+
+  bool do_dedup_full_read_and_write(ObjectContextRef obc,
+				    uint64_t chunk_index, uint64_t real_offset, uint64_t real_length,
+				    bufferlist &list, uint64_t ori_offset, uint64_t ori_length, 
+				    uint64_t log_offset);
+  void do_dedup_overwrite(ObjectContextRef obc, int chunk_index, 
+			  bufferlist &buf, uint64_t real_offset, uint64_t real_length, 
+			  bufferlist &list, uint64_t ori_offset, uint64_t ori_length, uint64_t log_offset);
+  ceph_tid_t do_dedup_write(string oid_fp, ObjectContextRef obc, int op_index,
+			    uint64_t chunk_index, ObjectOperation * o_op, uint64_t real_offset, 
+			    uint64_t real_length, uint64_t log_offset);
 
   friend struct C_ProxyChunkRead;
   friend struct C_DedupReadWrite;
   friend struct C_DedupWrite_Commit;
+  friend struct C_DedupWrite_Log;
 
 public:
   PrimaryLogPG(OSDService *o, OSDMapRef curmap,
