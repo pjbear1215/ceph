@@ -6940,6 +6940,13 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	    do_write_log(ctx, obs, oi, osd_op, op); 
 	    break;
 	  }
+	  
+	  if (!agent_state) {
+	    /* create a agent */
+	    agent_state.reset(new TierAgentState);
+	    agent_state->position = hobject_t();
+	    agent_state->start = agent_state->position;
+	  }
 #if 0
 	    write_update_size_and_usage(ctx->delta_stats, oi, ctx->modified_ranges,
 					op.extent.offset, op.extent.length);
@@ -6999,6 +7006,12 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  if (can_do_write_log(ctx, obs, oi, osd_op, op)) {
 	    do_write_log(ctx, obs, oi, osd_op, op); 
 	    break;
+	  }
+	  if (!agent_state) {
+	    /* create a agent */
+	    agent_state.reset(new TierAgentState);
+	    agent_state->position = hobject_t();
+	    agent_state->start = agent_state->position;
 	  }
 #if 0
 	    write_update_size_and_usage(ctx->delta_stats, oi, ctx->modified_ranges,
@@ -11086,6 +11099,8 @@ int PrimaryLogPG::manifest_dedup_log_flush()
   if (pool.info.log_oid == hobject_t()) {
     assert(0 == "log oid is null");
   }
+
+  dout(0) << __func__ << " start! " << dendl;
   ObjectContextRef log_obc = get_object_context(pool.info.log_oid, false);
 
   /* read the log */
@@ -11139,8 +11154,7 @@ int PrimaryLogPG::manifest_dedup_log_flush()
 	continue;
       }
 
-      //oi.manifest.chunk_map[s_offset].flags = chunk_info_t::FLAG_DELETED;
-      ObjectContextRef obc = get_object_context(pool.info.log_oid, false);
+      ObjectContextRef obc = get_object_context(tgt_soid, false);
       assert(obc);
       bufferlist list;
       bufferptr tmp_buf(tgt_length);
@@ -15185,6 +15199,11 @@ bool PrimaryLogPG::agent_work(int start_max, int agent_flush_quota)
     unlock();
     return true;
   }
+  
+  if (pool.info.manifest_mode == pg_pool_t::MANIFEST_DEDUP_LOGCACHE) {
+    manifest_dedup_log_flush(); 
+    return true;
+  }
 
   assert(!deleting);
 
@@ -15649,6 +15668,15 @@ void PrimaryLogPG::agent_choose_mode_restart()
 
 bool PrimaryLogPG::agent_choose_mode(bool restart, OpRequestRef op)
 {
+  if (pool.info.manifest_mode == pg_pool_t::MANIFEST_DEDUP_LOGCACHE) {
+    ObjectContextRef log_obc = get_object_context(pool.info.log_oid, false);
+    if (!log_obc) {
+      return false;
+    }
+    if (log_obc->obs.oi.size > 4194304 * 2) {
+      osd->agent_enable_pg(this, 0);
+    }
+  }
   bool requeued = false;
   // Let delay play out
   if (agent_state->delaying) {
