@@ -919,6 +919,8 @@ protected:
   map<eversion_t,
       list<pair<OpRequestRef, version_t> > > waiting_for_ondisk;
 
+  set<hobject_t> waiting_for_flushed_object;
+
   void requeue_object_waiters(map<hobject_t, list<OpRequestRef>>& m);
   void requeue_op(OpRequestRef op);
   void requeue_ops(list<OpRequestRef> &l);

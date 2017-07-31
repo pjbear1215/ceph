@@ -1575,7 +1575,6 @@ void pg_pool_t::encode(bufferlist& bl, uint64_t features) const
     ::encode(c, bl);
     ::encode(dedup_chunk_size, bl);
     ::encode(tgt_pool, bl);
-    ::encode(log_oid, bl);
   }
   ENCODE_FINISH(bl);
 }
@@ -1735,7 +1734,6 @@ void pg_pool_t::decode(bufferlist::iterator& bl)
     manifest_mode = (manifest_mode_t)v;
     ::decode(dedup_chunk_size, bl);
     ::decode(tgt_pool, bl);
-    ::decode(log_oid, bl);
   } else {
     manifest_mode = pg_pool_t::MANIFEST_NONE;
     dedup_chunk_size = 131072;
@@ -2686,7 +2684,7 @@ void pg_history_t::generate_test_instances(list<pg_history_t*>& o)
 
 void pg_info_t::encode(bufferlist &bl) const
 {
-  ENCODE_START(32, 26, bl);
+  ENCODE_START(33, 26, bl);
   ::encode(pgid.pgid, bl);
   ::encode(last_update, bl);
   ::encode(last_complete, bl);
@@ -2706,6 +2704,7 @@ void pg_info_t::encode(bufferlist &bl) const
   ::encode(last_backfill, bl);
   ::encode(last_backfill_bitwise, bl);
   ::encode(last_interval_started, bl);
+  ::encode(log_oid, bl);
   ENCODE_FINISH(bl);
 }
 
@@ -2733,6 +2732,9 @@ void pg_info_t::decode(bufferlist::iterator &bl)
     ::decode(last_interval_started, bl);
   } else {
     last_interval_started = last_epoch_started;
+  }
+  if (struct_v >= 33) {
+    ::decode(log_oid, bl);
   }
   DECODE_FINISH(bl);
 }
@@ -4982,7 +4984,8 @@ void chunk_info_t::dump(Formatter *f) const
 ostream& operator<<(ostream& out, const chunk_info_t& ci)
 {
   return out << "(len: " << ci.length << " oid: " << ci.oid 
-	     << " flags: " << ci.get_flag_string(ci.flags) << ")";
+	     << " flags: " << ci.get_flag_string(ci.flags) 
+	     << " offset: " << ci.offset << ")";
 }
 
 // -- object_manifest_t --

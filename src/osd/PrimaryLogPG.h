@@ -1409,8 +1409,8 @@ protected:
   bool can_do_write_log(OpContext *ctx, ObjectState& obs, object_info_t& oi, OSDOp& osd_op, 
 			ceph_osd_op& op);
   void start_dedup_agent();
-  int manifest_dedup_log_flush();
-  void update_dedup_log_meta(ObjectContextRef obc, uint64_t offset, uint64_t flags);
+  int manifest_dedup_log_flush(ObjectContextRef obc);
+  void update_dedup_log_meta(ObjectContextRef log_obc, ObjectContextRef obc, uint64_t offset, uint64_t flags);
 
   bool do_dedup_full_read_and_write(ObjectContextRef obc,
 				    uint64_t chunk_index, uint64_t real_offset, uint64_t real_length,
@@ -1418,10 +1418,12 @@ protected:
 				    uint64_t log_offset);
   void do_dedup_overwrite(ObjectContextRef obc, int chunk_index, 
 			  bufferlist &buf, uint64_t real_offset, uint64_t real_length, 
-			  bufferlist &list, uint64_t ori_offset, uint64_t ori_length, uint64_t log_offset);
+			  uint64_t ori_offset, uint64_t ori_length, uint64_t log_offset);
   ceph_tid_t do_dedup_write(string oid_fp, ObjectContextRef obc, int op_index,
 			    uint64_t chunk_index, ObjectOperation * o_op, uint64_t real_offset, 
 			    uint64_t real_length, uint64_t log_offset);
+  void maybe_create_new_manifest(OpContext *ctx);
+  void dedup_need_requeue(ObjectContextRef obc);
 
   friend struct C_ProxyChunkRead;
   friend struct C_DedupReadWrite;

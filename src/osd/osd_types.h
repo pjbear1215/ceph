@@ -1380,7 +1380,6 @@ public:
   manifest_mode_t manifest_mode;
   uint64_t dedup_chunk_size;
   int tgt_pool;
-  hobject_t log_oid;
 
 private:
   vector<uint32_t> grade_table;
@@ -2309,6 +2308,8 @@ struct pg_info_t {
 
   pg_history_t history;
   pg_hit_set_history_t hit_set;
+
+  hobject_t log_oid;
 
   friend bool operator==(const pg_info_t& l, const pg_info_t& r) {
     return
@@ -4455,13 +4456,14 @@ struct chunk_info_t {
     FLAG_DIRTY = 1, 
     FLAG_MISSING = 2,
     FLAG_CLEAN = 4,
-    FLAG_DELETED = 5,
-    FLAG_IN_LOG = 6,
+    FLAG_DELETED = 8,
+    FLAG_IN_LOG = 16,
+    FLAG_IN_FLUSHING = 32,
   };
   uint64_t length;
   hobject_t oid;
   uint64_t flags;   // FLAG_*
-  uint64_t offset;
+  uint64_t offset;  // log's offset
 
   chunk_info_t() : length(0), flags(0) { }
 
@@ -4475,6 +4477,15 @@ struct chunk_info_t {
     }
     if (flags & FLAG_CLEAN) {
       r += "|clean";
+    }
+    if (flags & FLAG_DELETED) {
+      r += "|deleted";
+    }
+    if (flags & FLAG_IN_LOG) {
+      r += "|in_log";
+    }
+    if (flags & FLAG_IN_FLUSHING) {
+      r += "|in_flushing";
     }
     if (r.length())
       return r.substr(1);
@@ -4531,6 +4542,7 @@ struct object_manifest_t {
     case TYPE_REDIRECT: return "redirect";
     case TYPE_CHUNKED: return "chunked";
     case TYPE_REFERENCE_COUNT: return "ref_cnt";
+    case TYPE_LOG: return "log";
     default: return "unknown";
     }
   }
