@@ -919,7 +919,10 @@ protected:
   map<eversion_t,
       list<pair<OpRequestRef, version_t> > > waiting_for_ondisk;
 
-  set<hobject_t> waiting_for_flushed_object;
+  map<hobject_t, list<uint64_t>> waiting_for_flushed_object;
+  map<hobject_t, list<uint64_t>> requested_for_flushing_object;
+  ObjectContextRef lc_data_cache;
+  ObjectContextRef lc_entry_cache;
 
   void requeue_object_waiters(map<hobject_t, list<OpRequestRef>>& m);
   void requeue_op(OpRequestRef op);

@@ -2705,6 +2705,9 @@ void pg_info_t::encode(bufferlist &bl) const
   ::encode(last_backfill_bitwise, bl);
   ::encode(last_interval_started, bl);
   ::encode(log_oid, bl);
+  ::encode(lc_header, bl);
+  ::encode(log_entry_oid, bl);
+  ::encode(log_data_oid, bl);
   ENCODE_FINISH(bl);
 }
 
@@ -2735,6 +2738,9 @@ void pg_info_t::decode(bufferlist::iterator &bl)
   }
   if (struct_v >= 33) {
     ::decode(log_oid, bl);
+    ::decode(lc_header, bl);
+    ::decode(log_entry_oid, bl);
+    ::decode(log_data_oid, bl);
   }
   DECODE_FINISH(bl);
 }
@@ -4957,6 +4963,7 @@ void chunk_info_t::encode(bufferlist& bl) const
   ::encode(oid, bl);
   ::encode(flags, bl);
   ::encode(offset, bl);
+  ::encode(entry_offset, bl);
   ENCODE_FINISH(bl);
 }
 
@@ -4968,6 +4975,7 @@ void chunk_info_t::decode(bufferlist::iterator& bl)
   ::decode(flags, bl);
   if (struct_v >= 2) {
     ::decode(offset, bl);
+    ::decode(entry_offset, bl);
   }
   DECODE_FINISH(bl);
 }
@@ -4985,7 +4993,95 @@ ostream& operator<<(ostream& out, const chunk_info_t& ci)
 {
   return out << "(len: " << ci.length << " oid: " << ci.oid 
 	     << " flags: " << ci.get_flag_string(ci.flags) 
-	     << " offset: " << ci.offset << ")";
+	     << " offset: " << ci.offset << " entry offset: " 
+	     << ci.entry_offset << ")";
+}
+
+// log cache
+
+void logcache_header::encode(bufferlist& bl) const
+{
+  ENCODE_START(1, 1, bl);
+  ::encode(version, bl);
+  ::encode(chunk_length, bl);
+  ::encode(entries, bl);
+  ::encode(start_pos, bl);
+  ::encode(end_pos, bl);
+  ::encode(start_entry_pos, bl);
+  ::encode(end_entry_pos, bl);
+  ::encode(next_entry_pos, bl);
+  ::encode(next_pos, bl);
+  ENCODE_FINISH(bl);
+}
+
+void logcache_header::decode(bufferlist::iterator& bl)
+{
+  DECODE_START(1, bl);
+  ::decode(version, bl);
+  ::decode(chunk_length, bl);
+  ::decode(entries, bl);
+  ::decode(start_pos, bl);
+  ::decode(end_pos, bl);
+  ::decode(start_entry_pos, bl);
+  ::decode(end_entry_pos, bl);
+  ::decode(next_entry_pos, bl);
+  ::decode(next_pos, bl);
+  DECODE_FINISH(bl);
+}
+
+ostream& operator<<(ostream& out, const logcache_header& he)
+{
+  out << "logcache_header(" << he.version;
+  out << " chunk_length:" << he.chunk_length;
+  out << " entries:" << he.entries;
+  out << " start_pos:" << he.start_pos;
+  out << " end_pos:" << he.end_pos;
+  out << " start_entry_pos:" << he.start_entry_pos;
+  out << " end_entry_pos:" << he.end_entry_pos;
+  out << " next_entry_pos:" << he.next_entry_pos;
+  out << " next_pos:" << he.next_pos;
+  out << ")";
+  return out;
+}
+
+// log entry 
+//
+void logcache_entry::encode(bufferlist& bl) const
+{
+  ENCODE_START(1, 1, bl);
+  ::encode(idx, bl);
+  ::encode(tgt_oid, bl);
+  ::encode(start_entry_offset, bl);
+  ::encode(start_log_offset, bl);
+  ::encode(length, bl);
+  ::encode(tgt_oid_offset, bl);
+  ::encode(flag, bl);
+  ENCODE_FINISH(bl);
+}
+
+void logcache_entry::decode(bufferlist::iterator& bl)
+{
+  DECODE_START(1, bl);
+  ::decode(idx, bl);
+  ::decode(tgt_oid, bl);
+  ::decode(start_entry_offset, bl);
+  ::decode(start_log_offset, bl);
+  ::decode(length, bl);
+  ::decode(tgt_oid_offset, bl);
+  ::decode(flag, bl);
+  DECODE_FINISH(bl);
+}
+
+ostream& operator<<(ostream& out, const logcache_entry& en)
+{
+  out << "logentry_entry(" << en.tgt_oid;
+  out << " start_entry_offset:" << en.start_entry_offset;
+  out << " start_log_offset:" << en.start_log_offset;
+  out << " length:" << en.length;
+  out << " tgt_oid_offset:" << en.tgt_oid_offset;
+  out << " flag:" << (int)en.flag;
+  out << ")";
+  return out;
 }
 
 // -- object_manifest_t --

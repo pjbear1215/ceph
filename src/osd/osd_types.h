@@ -2288,6 +2288,24 @@ inline ostream& operator<<(ostream& out, const pg_history_t& h) {
  *  - if last_complete >= log.bottom, then we know pg contents thru log.head.
  *    otherwise, we have no idea what the pg is supposed to contain.
  */
+struct logcache_header {
+  uint64_t version;
+  uint64_t chunk_length;
+  uint64_t entries;
+  uint64_t start_pos;
+  uint64_t end_pos;
+  uint64_t start_entry_pos;
+  uint64_t end_entry_pos;
+  uint64_t next_entry_pos;
+  uint64_t next_pos;
+  void encode(bufferlist &bl) const;
+  void decode(bufferlist::iterator &bl);
+  logcache_header() : chunk_length(0), entries(0), start_pos(0), end_pos(0) { }
+  //friend ostream& operator<<(ostream& out, const logcache_header& he);
+};
+WRITE_CLASS_ENCODER(logcache_header)
+ostream& operator<<(ostream& out, const logcache_header& he);
+
 struct pg_info_t {
   spg_t pgid;
   eversion_t last_update;      ///< last object version applied to store.
@@ -2310,6 +2328,9 @@ struct pg_info_t {
   pg_hit_set_history_t hit_set;
 
   hobject_t log_oid;
+  logcache_header lc_header;
+  hobject_t log_entry_oid;
+  hobject_t log_data_oid;
 
   friend bool operator==(const pg_info_t& l, const pg_info_t& r) {
     return
@@ -4453,17 +4474,23 @@ static inline ostream& operator<<(ostream& out, const notify_info_t& n) {
 
 struct chunk_info_t {
   enum {
+    FLAG_NONE = 0, 
     FLAG_DIRTY = 1, 
     FLAG_MISSING = 2,
     FLAG_CLEAN = 4,
     FLAG_DELETED = 8,
-    FLAG_IN_LOG = 16,
-    FLAG_IN_FLUSHING = 32,
+    FLAG_IN_LOG_ONLY = 16,
+    FLAG_IN_LOG_FLUSHED = 32,
+    FLAG_IN_FLUSHING = 64,
+    FLAG_IN_CACHE = 128,
+    FLAG_WRITING = 256,
+    FLAG_IN_LOG_ONLY_DIRTY = 512,
   };
   uint64_t length;
   hobject_t oid;
   uint64_t flags;   // FLAG_*
   uint64_t offset;  // log's offset
+  uint64_t entry_offset;  // entry's offset (log's meta)
 
   chunk_info_t() : length(0), flags(0) { }
 
@@ -4481,11 +4508,17 @@ struct chunk_info_t {
     if (flags & FLAG_DELETED) {
       r += "|deleted";
     }
-    if (flags & FLAG_IN_LOG) {
-      r += "|in_log";
+    if (flags & FLAG_IN_LOG_ONLY) {
+      r += "|in_log_only";
+    }
+    if (flags & FLAG_IN_LOG_FLUSHED) {
+      r += "|in_log_flushed";
     }
     if (flags & FLAG_IN_FLUSHING) {
       r += "|in_flushing";
+    }
+    if (flags & FLAG_IN_LOG_ONLY_DIRTY) {
+      r += "|in_log_only_dirty";
     }
     if (r.length())
       return r.substr(1);
@@ -4499,6 +4532,29 @@ struct chunk_info_t {
 WRITE_CLASS_ENCODER(chunk_info_t)
 ostream& operator<<(ostream& out, const chunk_info_t& ci);
 
+
+
+struct logcache_entry {
+  enum {
+    TYPE_VALID = 1,
+    TYPE_DELETED = 2,
+  };
+  uint64_t idx;
+  hobject_t tgt_oid;
+  uint64_t start_entry_offset;
+  uint64_t start_log_offset;
+  uint64_t length;
+  uint64_t tgt_oid_offset;
+  uint8_t flag;
+  void encode(bufferlist &bl) const;
+  void decode(bufferlist::iterator &bl);
+  logcache_entry() : idx(0), start_log_offset(0), length(0), tgt_oid_offset(0), flag(0) { tgt_oid = hobject_t(); }
+  //friend ostream& operator<<(ostream& out, const logcache_entry& en);
+
+};
+WRITE_CLASS_ENCODER(logcache_entry)
+ostream& operator<<(ostream& out, const logcache_entry& en);
+
 struct object_info_t;
 struct object_manifest_t {
   enum {
@@ -4508,6 +4564,10 @@ struct object_manifest_t {
     TYPE_REFERENCE_COUNT = 3,
     TYPE_LOG = 4,
   };
+  enum {
+    STATE_WAIT_DIRTY = 1,
+    STATE_FLUSH_ALL = 2,
+  };
   uint8_t type;  // redirect, chunked, ...
   hobject_t redirect_target;
   map <uint64_t, chunk_info_t> chunk_map;
@@ -4516,10 +4576,12 @@ struct object_manifest_t {
   uint64_t ref_cnt;
   uint64_t start_offset;
   uint64_t end_offset;
+  bool need_promote;
+  uint8_t logcache_state;
 
-  object_manifest_t() : type(0) { }
+  object_manifest_t() : type(0), need_promote(false), logcache_state(0) { }
   object_manifest_t(uint8_t type, const hobject_t& redirect_target) 
-    : type(type), redirect_target(redirect_target) { }
+    : type(type), redirect_target(redirect_target), need_promote(false), logcache_state(0) { }
 
   bool is_empty() const {
     return type == TYPE_NONE;

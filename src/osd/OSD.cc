@@ -250,7 +250,8 @@ OSDService::OSDService(OSD *osd) :
   promote_max_objects(0),
   promote_max_bytes(0),
   objecter(new Objecter(osd->client_messenger->cct, osd->objecter_messenger, osd->monc, NULL, 0, 0)),
-  objecter_finisher(osd->client_messenger->cct),
+  //objecter_finisher(osd->client_messenger->cct),
+  m_objecter_finishers(cct->_conf->osd_objecter_finishers),
   watch_lock("OSDService::watch_lock"),
   watch_timer(osd->client_messenger->cct, watch_lock),
   next_notif_id(0),
@@ -290,11 +291,21 @@ OSDService::OSDService(OSD *osd) :
 #endif
 {
   objecter->init();
+  for (int i = 0; i < m_objecter_finishers; i++) {
+    ostringstream str;
+    str << "objecter-finisher-" << i;
+    Finisher *fin = new Finisher(osd->client_messenger->cct, str.str(), "obj-finisher");
+    objecter_finishers.push_back(fin);
+  }
 }
 
 OSDService::~OSDService()
 {
   delete objecter;
+  for (auto f : objecter_finishers) {
+    delete f;
+    f = NULL;
+  }
 }
 
 
@@ -536,8 +547,13 @@ void OSDService::shutdown()
   }
 
   objecter->shutdown();
-  objecter_finisher.wait_for_empty();
-  objecter_finisher.stop();
+  //objecter_finisher.wait_for_empty();
+  //objecter_finisher.stop();
+
+  for (auto f : objecter_finishers) {
+    f->wait_for_empty();
+    f->stop();
+  }
 
   {
     Mutex::Locker l(recovery_request_lock);
@@ -556,7 +572,10 @@ void OSDService::shutdown()
 void OSDService::init()
 {
   reserver_finisher.start();
-  objecter_finisher.start();
+  //objecter_finisher.start();
+  for (auto f : objecter_finishers) {
+    f->start();
+  }
   objecter->set_client_incarnation(0);
 
   // deprioritize objecter in daemonperf output
@@ -610,7 +629,7 @@ void OSDService::agent_entry()
     }
     uint64_t level = agent_queue.rbegin()->first;
     set<PGRef>& top = agent_queue.rbegin()->second;
-    dout(0) << __func__
+    dout(20) << __func__
 	     << " tiers " << agent_queue.size()
 	     << ", top is " << level
 	     << " with pgs " << top.size()
@@ -633,7 +652,7 @@ void OSDService::agent_entry()
       agent_valid_iterator = true;
     }
     PGRef pg = *agent_queue_pos;
-    dout(0) << "high_count " << flush_mode_high_count
+    dout(20) << "high_count " << flush_mode_high_count
 	     << " agent_ops " << agent_ops
 	     << " flush_quota " << agent_flush_quota << dendl;
     agent_lock.Unlock();

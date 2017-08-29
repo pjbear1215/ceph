@@ -1317,8 +1317,8 @@ protected:
   int do_manifest_flush(OpRequestRef op, ObjectContextRef obc,
 			SnapContext &snapc, FlushOpRef fop);
   void do_manifest_flush_partial(OpRequestRef op, ObjectContextRef obc, uint64_t offset,
-				  uint64_t length, bufferlist &list, uint64_t log_offset,
-				  uint64_t op_index);
+				  uint64_t length, bufferlist &list, uint64_t entry_offset, 
+				  uint64_t log_offset, uint64_t op_index);
 
   /// @return false if clone is has been evicted
   bool is_present_clone(hobject_t coid);
@@ -1401,29 +1401,39 @@ protected:
 			uint64_t real_offset, uint64_t real_length,
 			uint64_t &d_offset, uint64_t &d_length,
 			uint64_t &s_offset);
+  bool update_dedup_meta(ObjectContextRef obc, uint64_t offset, uint64_t entry_offset, uint64_t log_offset);
   void update_dedup_meta(ObjectContextRef obc, uint64_t offset);
   void dec_dedup_ref(ObjectContextRef obc, map<uint64_t, hobject_t> &modified_chunks);
   bool need_bypass_oid(string oid_name);
-  void do_write_log(OpContext *ctx, ObjectState& obs, object_info_t& oi, OSDOp& osd_op,
+  bool do_write_log(OpContext *ctx, ObjectState& obs, object_info_t& oi, OSDOp& osd_op,
 		    ceph_osd_op& op);
   bool can_do_write_log(OpContext *ctx, ObjectState& obs, object_info_t& oi, OSDOp& osd_op, 
 			ceph_osd_op& op);
+  bool can_do_read_cache(ObjectContextRef obc);
   void start_dedup_agent();
-  int manifest_dedup_log_flush(ObjectContextRef obc);
+  int manifest_dedup_log_flush(ObjectContextRef obc, int flush_cnt);
   void update_dedup_log_meta(ObjectContextRef log_obc, ObjectContextRef obc, uint64_t offset, uint64_t flags);
 
   bool do_dedup_full_read_and_write(ObjectContextRef obc,
 				    uint64_t chunk_index, uint64_t real_offset, uint64_t real_length,
 				    bufferlist &list, uint64_t ori_offset, uint64_t ori_length, 
-				    uint64_t log_offset);
+				    uint64_t entry_offset, uint64_t log_offset);
   void do_dedup_overwrite(ObjectContextRef obc, int chunk_index, 
-			  bufferlist &buf, uint64_t real_offset, uint64_t real_length, 
-			  uint64_t ori_offset, uint64_t ori_length, uint64_t log_offset);
+			  bufferlist &base_buf, bufferlist &over_buf, uint64_t real_offset, uint64_t real_length, 
+			  uint64_t ori_offset, uint64_t ori_length, uint64_t entry_offset, uint64_t log_offset);
   ceph_tid_t do_dedup_write(string oid_fp, ObjectContextRef obc, int op_index,
 			    uint64_t chunk_index, ObjectOperation * o_op, uint64_t real_offset, 
-			    uint64_t real_length, uint64_t log_offset);
+			    uint64_t real_length, uint64_t entry_offset, uint64_t log_offset);
   void maybe_create_new_manifest(OpContext *ctx);
-  void dedup_need_requeue(ObjectContextRef obc);
+  void dedup_need_requeue(ObjectContextRef obc, uint64_t offset, bool need_requeue, uint64_t entry_offset, 
+			  uint64_t log_offset);
+  void sync_logcache_header(PGTransaction *t, logcache_header &lc_header);
+  void load_logcache_header(logcache_header &lc_header);
+  void sync_logcache_entry(PGTransaction *t, logcache_header &lc_header, logcache_entry &lc_entry);
+  void load_logcache_entry(logcache_header &lc_header, logcache_entry &lc_entry);
+  int manifest_dedup_copy_log_to_cache(ObjectContextRef tgt_obc, PGTransaction *t);
+  int manifest_dedup_log_flush_object(ObjectContextRef tgt_obc);
+  void dedup_remove_waiting_q(ObjectContextRef obc, uint64_t offset);
 
   friend struct C_ProxyChunkRead;
   friend struct C_DedupReadWrite;
@@ -1561,6 +1571,8 @@ private:
       return pg->is_clean() && !pg->scrubber.active && !pg->snap_trimq.empty();
     }
   } snap_trimmer_machine;
+
+  bool flush_enabled;
 
   struct WaitReservation;
   struct Trimming : boost::statechart::state< Trimming, SnapTrimmer, WaitReservation >, NamedState {
