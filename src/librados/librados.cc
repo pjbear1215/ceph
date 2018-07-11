@@ -620,11 +620,19 @@ void librados::ObjectWriteOperation::set_chunk(uint64_t src_offset,
 					       const IoCtx& tgt_ioctx,
 					       string tgt_oid,
 					       uint64_t tgt_offset,
-					       int flag)
+					       int flag,
+					       uint8_t chunk_mode,
+					       uint8_t fingerprint_mode)
 {
   ::ObjectOperation *o = &impl->o;
-  o->set_chunk(src_offset, src_length, 
-	       tgt_ioctx.io_ctx_impl->oloc, object_t(tgt_oid), tgt_offset, flag);
+  if (chunk_mode == 0 && fingerprint_mode == 0) {
+    o->set_chunk(src_offset, src_length, 
+		 tgt_ioctx.io_ctx_impl->oloc, object_t(tgt_oid), tgt_offset, flag);
+  } else {
+    o->set_chunk(src_offset, src_length, 
+		 tgt_ioctx.io_ctx_impl->oloc, object_t(tgt_oid), tgt_offset, flag,
+		 chunk_mode, fingerprint_mode);
+  }
 }
 
 void librados::ObjectWriteOperation::tier_promote()

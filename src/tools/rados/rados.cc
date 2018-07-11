@@ -128,8 +128,8 @@ void usage(ostream& out)
 "                                    set allocation hint for an object\n"
 "   set-redirect <object A> --target-pool <caspool> <target object A> [--with-reference]\n"
 "                                    set redirect target\n"
-"   set-chunk <object A> <offset> <length> --target-pool <caspool> <target object A> <taget-offset> [--with-reference]\n"
-"                                    convert an object to chunked object\n"
+"   set-chunk <object A> <offset> <length> --target-pool <caspool> <target object A> <taget-offset> [--with-reference] [chunk_mode] [fingerprint_mode]\n"
+"                                    convert an object to chunked (or deduped) object\n"
 "   tier-promote <obj-name>	     promote the object to the base tier\n"
 "\n"
 "IMPORT AND EXPORT\n"
@@ -3642,7 +3642,7 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
     uint64_t offset;
     uint64_t length;
     uint64_t tgt_offset;
-    string tgt_oid;
+    string tgt_oid, chunk, fingerprint;
     if (nargs.size() < 6) {
       usage_exit();
     } else {
@@ -3666,13 +3666,30 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
 	ret = -EINVAL;
 	goto out;
       }
+      chunk = string(nargs[6]);
+      fingerprint = string(nargs[7]);
     }
 
     IoCtx target_ctx;
     ret = rados.ioctx_create(target, target_ctx);
     ObjectWriteOperation op;
     if (with_reference) {
-      op.set_chunk(offset, length, target_ctx, tgt_oid, tgt_offset, CEPH_OSD_OP_FLAG_WITH_REFERENCE);
+      uint8_t chunk_mode = 0, fingerprint_mode = 0;
+      int flag = CEPH_OSD_OP_FLAG_WITH_REFERENCE;
+      if (chunk == "fixed") {
+	chunk_mode = CEPH_OSD_DEDUP_OP_FIXED_CHUNK;
+      }
+      if (fingerprint == "sha1") {
+	fingerprint_mode = CEPH_OSD_DEDUP_OP_SHA1_FINGERPRINT;
+      } else {
+	if (chunk == "fixed") {
+	  cerr << "Invalid fingerprint mode " << std::endl;
+	  ret = -EINVAL;
+	  goto out;
+	}
+      }
+      op.set_chunk(offset, length, target_ctx, tgt_oid, tgt_offset, flag,
+		   chunk_mode, fingerprint_mode);
     } else {
       op.set_chunk(offset, length, target_ctx, tgt_oid, tgt_offset);
     }

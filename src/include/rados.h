@@ -469,6 +469,7 @@ enum {
 	CEPH_OSD_OP_FLAG_FADVISE_DONTNEED   = 0x20,/* data will not be accessed in the near future */
 	CEPH_OSD_OP_FLAG_FADVISE_NOCACHE   = 0x40, /* data will be accessed only once by this client */
 	CEPH_OSD_OP_FLAG_WITH_REFERENCE   = 0x80, /* need reference couting */
+	CEPH_OSD_OP_FLAG_WITH_DEDUP = 0x100, /* dedup */
 };
 
 #define EOLDSNAPC    85  /* ORDERSNAP flag set; writer has old snapc*/
@@ -539,6 +540,13 @@ enum {
 	CEPH_OSD_BACKOFF_OP_BLOCK = 1,
 	CEPH_OSD_BACKOFF_OP_ACK_BLOCK = 2,
 	CEPH_OSD_BACKOFF_OP_UNBLOCK = 3,
+};
+
+enum {
+	CEPH_OSD_DEDUP_OP_FIXED_CHUNK = 1,
+};
+enum {
+	CEPH_OSD_DEDUP_OP_SHA1_FINGERPRINT = 1,
 };
 
 const char *ceph_osd_backoff_op_name(int op);

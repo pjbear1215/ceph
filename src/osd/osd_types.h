@@ -4570,11 +4570,13 @@ struct chunk_info_t {
     FLAG_DIRTY = 1, 
     FLAG_MISSING = 2,
     FLAG_HAS_REFERENCE = 4,
+    FLAG_HAS_FINGERPRINT = 8,
   };
   uint32_t offset;
   uint32_t length;
   hobject_t oid;
   uint32_t flags;   // FLAG_*
+  string fp;
 
   chunk_info_t() : offset(0), length(0), flags(0) { }
 
@@ -4588,6 +4590,9 @@ struct chunk_info_t {
     }
     if (flags & FLAG_HAS_REFERENCE) {
       r += "|has_reference";
+    }
+    if (flags & FLAG_HAS_FINGERPRINT) {
+      r += "|has_fingerprint";
     }
     if (r.length())
       return r.substr(1);
@@ -4607,10 +4612,19 @@ struct object_manifest_t {
     TYPE_NONE = 0,
     TYPE_REDIRECT = 1, 
     TYPE_CHUNKED = 2, 
+    TYPE_DEDUPED = 3, 
+  };
+  enum {
+    TYPE_FIXED_CHUNK = 1,
+  };
+  enum {
+    TYPE_SHA1_FINGERPRINT = 1,
   };
   uint8_t type;  // redirect, chunked, ...
   hobject_t redirect_target;
   map <uint64_t, chunk_info_t> chunk_map;
+  uint8_t chunk_mode; // fixed, cdc ...
+  uint8_t fingerprint_mode; // sha1, ...
 
   object_manifest_t() : type(0) { }
   object_manifest_t(uint8_t type, const hobject_t& redirect_target) 
@@ -4625,11 +4639,15 @@ struct object_manifest_t {
   bool is_chunked() const {
     return type == TYPE_CHUNKED;
   }
+  bool is_deduped() const {
+    return type == TYPE_DEDUPED;
+  }
   static const char *get_type_name(uint8_t m) {
     switch (m) {
     case TYPE_NONE: return "none";
     case TYPE_REDIRECT: return "redirect";
     case TYPE_CHUNKED: return "chunked";
+    case TYPE_DEDUPED: return "deduped";
     default: return "unknown";
     }
   }

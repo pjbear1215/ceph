@@ -1142,7 +1142,8 @@ struct ObjectOperation {
   }
 
   void set_chunk(uint64_t src_offset, uint64_t src_length, object_locator_t tgt_oloc,
-		 object_t tgt_oid, uint64_t tgt_offset, int flag) {
+		 object_t tgt_oid, uint64_t tgt_offset, int flag, uint8_t chunk_mode = 0, 
+		 uint8_t fingerprint_mode = 0) {
     OSDOp& osd_op = add_op(CEPH_OSD_OP_SET_CHUNK);
     encode(src_offset, osd_op.indata);
     encode(src_length, osd_op.indata);
@@ -1150,6 +1151,10 @@ struct ObjectOperation {
     encode(tgt_oid, osd_op.indata);
     encode(tgt_offset, osd_op.indata);
     set_last_op_flags(flag);
+    if (chunk_mode != 0 && fingerprint_mode != 0) {
+      encode(chunk_mode, osd_op.indata);
+      encode(fingerprint_mode, osd_op.indata);
+    }
   }
 
   void tier_promote() {

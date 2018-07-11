@@ -4945,6 +4945,9 @@ void chunk_info_t::encode(bufferlist& bl) const
   encode(length, bl);
   encode(oid, bl);
   encode(flags, bl);
+  if (flags & FLAG_HAS_FINGERPRINT) {
+    encode(fp, bl);
+  }
   ENCODE_FINISH(bl);
 }
 
@@ -4955,6 +4958,9 @@ void chunk_info_t::decode(bufferlist::iterator& bl)
   decode(length, bl);
   decode(oid, bl);
   decode(flags, bl);
+  if (flags & FLAG_HAS_FINGERPRINT) {
+    decode(fp, bl);
+  }
   DECODE_FINISH(bl);
 }
 
@@ -4971,7 +4977,8 @@ ostream& operator<<(ostream& out, const chunk_info_t& ci)
 {
   return out << "(len: " << ci.length << " oid: " << ci.oid
 	     << " offset: " << ci.offset
-	     << " flags: " << ci.get_flag_string(ci.flags) << ")";
+	     << " flags: " << ci.get_flag_string(ci.flags) 
+	     << " fp: " << ci.fp << ")";
 }
 
 // -- object_manifest_t --
@@ -4987,6 +4994,10 @@ void object_manifest_t::encode(bufferlist& bl) const
       break;
     case TYPE_CHUNKED:
       encode(chunk_map, bl);      
+      break;
+    case TYPE_DEDUPED:
+      encode(chunk_mode, bl);      
+      encode(fingerprint_mode, bl);      
       break;
     default:
       ceph_abort();
@@ -5006,6 +5017,10 @@ void object_manifest_t::decode(bufferlist::iterator& bl)
     case TYPE_CHUNKED:
       decode(chunk_map, bl);
       break;
+    case TYPE_DEDUPED:
+      decode(chunk_mode, bl);      
+      decode(fingerprint_mode, bl);      
+      break;
     default:
       ceph_abort();
   }
@@ -5020,6 +5035,15 @@ void object_manifest_t::dump(Formatter *f) const
     redirect_target.dump(f);
     f->close_section();
   } else if (type == TYPE_CHUNKED) {
+    f->open_array_section("chunk_map");
+    for (auto& p : chunk_map) {
+      f->open_object_section("chunk");
+      f->dump_unsigned("offset", p.first);
+      p.second.dump(f);
+      f->close_section();
+    }
+    f->close_section();
+  } else if (type == TYPE_DEDUPED) {
     f->open_array_section("chunk_map");
     for (auto& p : chunk_map) {
       f->open_object_section("chunk");
@@ -5044,6 +5068,8 @@ ostream& operator<<(ostream& out, const object_manifest_t& om)
     out << " " << om.redirect_target;
   } else if (om.is_chunked()) {
     out << " " << om.chunk_map;
+  } else if (om.is_deduped()) {
+    out << " " << om.chunk_mode << " " << om.fingerprint_mode;
   }
   out << ")";
   return out;

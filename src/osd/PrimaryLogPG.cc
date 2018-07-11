@@ -6837,12 +6837,17 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	object_locator_t tgt_oloc;
 	uint64_t src_offset, src_length, tgt_offset;
 	object_t tgt_name;
+	uint8_t chunk_mode, fingerprint_mode;
 	try {
 	  decode(src_offset, bp);
 	  decode(src_length, bp);
 	  decode(tgt_oloc, bp);
 	  decode(tgt_name, bp);
 	  decode(tgt_offset, bp);
+	  if (osd_op.op.flags & CEPH_OSD_OP_FLAG_WITH_DEDUP) {
+	    decode(chunk_mode, bp);
+	    decode(fingerprint_mode, bp);
+	  }
 	}
 	catch (buffer::error& e) {
 	  result = -EINVAL;
@@ -6867,6 +6872,21 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
         if (!oi.manifest.is_chunked()) {
           oi.manifest.clear();
         }
+
+	if (oi.manifest.is_deduped()) {
+	  if (oi.manifest.chunk_mode == object_manifest_t::TYPE_FIXED_CHUNK) {
+	    auto p = oi.manifest.chunk_map.begin();
+	    if (p->second.length != src_length) {
+	      result = -EOPNOTSUPP;
+	      goto fail;
+	    }
+	  }
+	  if (oi.manifest.chunk_mode != chunk_mode ||
+	      oi.manifest.fingerprint_mode != fingerprint_mode) {
+	    result = -EOPNOTSUPP;
+	    goto fail;
+	  }
+	}
 
 	pg_t raw_pg;
 	chunk_info_t chunk_info;
@@ -6907,6 +6927,14 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	    ctx->delta_stats.num_objects_manifest++;
 	  oi.set_flag(object_info_t::FLAG_MANIFEST);
 	  oi.manifest.type = object_manifest_t::TYPE_CHUNKED;
+	  if (osd_op.op.flags & CEPH_OSD_OP_FLAG_WITH_DEDUP) {
+	    if (chunk_mode == CEPH_OSD_DEDUP_OP_FIXED_CHUNK) {
+	      oi.manifest.chunk_mode = chunk_mode;
+	      oi.manifest.fingerprint_mode = fingerprint_mode;
+	    } else {
+	      assert(0 == "unrecognized chunk type");
+	    }
+	  }
 	  ctx->modify = true;
 
 	  dout(10) << "set-chunked oid:" << oi.soid << " user_version: " << oi.user_version 
