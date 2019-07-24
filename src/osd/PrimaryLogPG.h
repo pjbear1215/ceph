@@ -1453,8 +1453,9 @@ protected:
 			     uint64_t last_offset);
   void handle_manifest_flush(hobject_t oid, ceph_tid_t tid, int r,
 			     uint64_t offset, uint64_t last_offset, epoch_t lpr);
-  void refcount_manifest(ObjectContextRef obc, object_locator_t oloc, hobject_t soid,
-                         SnapContext snapc, bool get, Context *cb, uint64_t offset);
+  void refcount_manifest(ObjectContextRef obc, hobject_t src_soid, object_locator_t oloc,
+			 hobject_t tgt_soid, SnapContext snapc, bool get, Context *cb);
+  void dec_all_refcount_manifest(object_info_t& oi, OpContext* ctx);
 
   friend struct C_ProxyChunkRead;
   friend class PromoteManifestCallback;
