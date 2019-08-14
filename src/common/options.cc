@@ -3839,6 +3839,20 @@ std::vector<Option> get_global_options() {
     .set_default(64)
     .set_description(""),
 
+    // selective dispatch
+    Option("osd_threads_sd", Option::TYPE_INT, Option::LEVEL_ADVANCED)
+    .set_default(4)
+    .set_description("The number of sd threads"),
+    Option("osd_affinity_enable", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_description("the affinity of sd threads"),
+    Option("osd_per_node", Option::TYPE_INT, Option::LEVEL_ADVANCED)
+    .set_default(1)
+    .set_description("The number of osd per node"),
+    Option("osd_selective_dispatch_enable", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_description("selective dispatch"),
+
     Option("threadpool_default_timeout", Option::TYPE_INT, Option::LEVEL_ADVANCED)
     .set_default(60)
     .set_description(""),

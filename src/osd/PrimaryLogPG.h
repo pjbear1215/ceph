@@ -1902,6 +1902,20 @@ public:
   bool maybe_preempt_replica_scrub(const hobject_t& oid) override {
     return write_blocked_by_scrub(oid);
   }
+  // selective dispatch
+  void enqueue_sd_entry(object_t oid, spg_t pgid, uint64_t sd_seq) {
+    osd->enqueue_sd_entry(oid, pgid, sd_seq);
+  }
+  void do_sd_entry(object_t oid, spg_t pgid);
+  void send_signal_to_sd_queue(spg_t pgid) {
+    osd->send_signal_to_sd_queue(pgid);
+  }
+  uint64_t inc_sd_seq(spg_t pgid) {
+    return osd->inc_sd_seq(pgid);
+  }
+  uint64_t get_sd_seq(spg_t pgid) {
+    return osd->get_sd_seq(pgid);
+  }
   int rep_repair_primary_object(const hobject_t& soid, OpContext *ctx);
 
   // attr cache handling

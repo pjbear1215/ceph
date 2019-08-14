@@ -499,17 +499,108 @@ void ReplicatedBackend::submit_transaction(
     true,
     op_t);
   
+#ifdef ENABLE_SELECTIVE_DISPATCH
+  bool is_sd = false;
+  if (op.op->get_req()->get_data().length() >= 4096 &&
+      cct->_conf->osd_selective_dispatch_enable) {
+    is_sd = true;
+    op.op->is_sr_op = true;
+  }
+#if 0
+  bufferlist test_logs;
+  encode(log_entries, test_logs);
+  dout(0) << __func__ << " transaction size " << op_t.get_data_length()
+	  << " log size " << test_logs.length() << dendl;
+#endif
+  if (!is_sd) {
   op_t.register_on_commit(
     parent->bless_context(
       new C_OSD_OnOpCommit(this, &op)));
+  }
+#else 
+  op_t.register_on_commit(
+    parent->bless_context(
+      new C_OSD_OnOpCommit(this, &op)));
+#endif
 
   vector<ObjectStore::Transaction> tls;
   tls.push_back(std::move(op_t));
-
+#ifdef ENABLE_SELECTIVE_DISPATCH
+  // inc seq
+  uint64_t new_sd_seq = inc_sd_seq();
+  // queue
+  if (is_sd) {
+    sd_entry * en = new sd_entry;
+    en->tls = tls;
+    en->op = op.op;
+    en->pgid = get_parent()->whoami_spg_t();
+    en->type = PRIMARY_SD_IO;
+    en->at_version = at_version;
+    en->sd_seq = new_sd_seq;
+    sd_enqueue(en, soid.oid);
+    InProgressOpRef op_ref  = &op;
+    op_commit(op_ref);
+    return;
+  }
+#endif
   parent->queue_transactions(tls, op.op);
   if (at_version != eversion_t()) {
     parent->op_applied(at_version);
   }
+}
+
+//selective dispatch
+void ReplicatedBackend::do_sd_entry() {
+  //int flush_size = 50;
+  int done_io = 0;
+  //while (flush_size > 0 && sd_entries.size() > 0) {
+  sd_entry * en = sd_dequeue();
+  if (en) {
+    assert(en->tls.size());
+    parent->queue_transactions(en->tls, en->op);
+    if (en->type == PRIMARY_SD_IO) {
+      if (en->at_version != eversion_t()) {
+	parent->op_applied(en->at_version);
+      }
+    }
+    dout(0) << __func__ << " oid " << en->oid << " is done " << dendl;
+    delete en;
+  }
+  done_io++;
+  //}
+  dout(0) << __func__ << " pg " << get_parent()->whoami_spg_t() 
+	  << " done io : " << done_io << dendl;
+}
+
+void ReplicatedBackend::sd_enqueue(sd_entry * entry, object_t oid) {
+  // need to set the size of queue
+  get_parent()->enqueue_sd_entry(oid, entry->pgid, entry->sd_seq);
+  sd_entries.push(entry);
+  entry->oid = oid;
+  dout(0) << __func__ << " oid " << oid << " entry length " << sd_entries.size()
+	  << " type " << entry->type << " local cpu " << sched_getcpu() 
+	  << " op length " << entry->op->get_req()->get_data().length() << dendl;
+  if (sd_entries.size() >= SD_PG_SEND_SIGNAL) {
+    get_parent()->send_signal_to_sd_queue(entry->pgid);
+    dout(0) << __func__ << " seind signal to wake up sd queue " << dendl;
+  }
+}
+
+uint64_t ReplicatedBackend::inc_sd_seq() {
+  return get_parent()->inc_sd_seq(get_parent()->whoami_spg_t());
+}
+
+uint64_t ReplicatedBackend::get_sd_seq() {
+  return get_parent()->get_sd_seq(get_parent()->whoami_spg_t());
+}
+
+sd_entry * ReplicatedBackend::sd_dequeue() {
+  if (sd_entries.empty()) {
+    return NULL;
+  }
+  sd_entry * en = sd_entries.front();
+  sd_entries.pop();
+  return en;
 }
 
 void ReplicatedBackend::op_commit(
@@ -531,6 +622,12 @@ void ReplicatedBackend::op_commit(
   op->waiting_for_commit.erase(get_parent()->whoami_shard());
 
   if (op->waiting_for_commit.empty()) {
+    const MOSDOp *m = NULL;
+    if (op->op)
+      m = static_cast<const MOSDOp *>(op->op->get_req());
+    if (m) 
+      dout(0) << __func__ << " op is completed " << m->get_hobj()
+	      << dendl;
     op->on_commit->complete(0);
     op->on_commit = 0;
     in_progress_ops.erase(op->tid);
@@ -586,6 +683,9 @@ void ReplicatedBackend::do_repop_reply(OpRequestRef op)
 
     if (ip_op.waiting_for_commit.empty() &&
         ip_op.on_commit) {
+      if (m) 
+	dout(0) << __func__ << " op is completed " << m->get_hobj()
+		<< dendl;
       ip_op.on_commit->complete(0);
       ip_op.on_commit = 0;
       in_progress_ops.erase(iter);
@@ -1012,6 +1112,30 @@ void ReplicatedBackend::do_repop(OpRequestRef op)
 
   const hobject_t& soid = m->poid;
 
+#if 0
+#ifdef ENABLE_SELECTIVE_DISPATCH
+  // selective dispatch
+  if (!m->logbl.length()) {
+    dout(0) << __func__ << " got selective dispatch message " << dendl;
+    dout(0) << __func__ << " " << soid
+	     << " v " << m->version
+	     << dendl;
+    bufferlist buf = m->get_data();
+    dout(0) << __func__ << " data size is " << buf.length() << dendl;
+#if 0
+    ref_t<Message>temp = make_message<MOSDOp>();
+    assert(temp);
+    Message * msg = temp.detach();
+    decode(*(static_cast<MOSDOp*>(msg)), buf);
+#endif
+    //dout(0) << " object " << msg.hobj << " pg " << msg.pgid << dendl;
+    
+
+    return;
+  }
+#endif
+#endif
+
   dout(10) << __func__ << " " << soid
            << " v " << m->version
 	   << (m->logbl.length() ? " (transaction)" : " (parallel exec")
@@ -1091,13 +1215,44 @@ void ReplicatedBackend::do_repop(OpRequestRef op)
     rm->localt,
     async);
 
+#ifdef ENABLE_SELECTIVE_DISPATCH
+  bool is_sd = false;
+  if (op->get_req()->get_data().length() >= 4096 &&
+      cct->_conf->osd_selective_dispatch_enable) {
+    is_sd = true;
+    op->is_sr_op = true;
+  }
+  dout(0) << __func__ << " is_sd " << is_sd 
+	  << " length compare 1. message : " << op->get_req()->get_data().length()
+	  << " 2. mosdop : " << m->get_data().length() 
+	  << " opt " << rm->opt.get_data_length() 
+	  << " localt " << rm->localt.get_data_length() << dendl;
+  if (is_sd == false) {
   rm->opt.register_on_commit(
     parent->bless_context(
       new C_OSD_RepModifyCommit(this, rm)));
+  }
+#endif
   vector<ObjectStore::Transaction> tls;
   tls.reserve(2);
   tls.push_back(std::move(rm->localt));
   tls.push_back(std::move(rm->opt));
+#ifdef ENABLE_SELECTIVE_DISPATCH
+  //
+  uint64_t new_sd_seq = inc_sd_seq();
+  // queue
+  if (is_sd) {
+    sd_entry * en = new sd_entry;
+    en->tls = tls;
+    en->op = op;
+    en->pgid = get_parent()->whoami_spg_t();
+    en->type = SECONDARY_SD_IO;
+    en->sd_seq = new_sd_seq;
+    sd_enqueue(en, soid.oid);
+    repop_commit(rm);
+    return;
+  }
+#endif
   parent->queue_transactions(tls, op);
   // op is cleaned up by oncommit/onapply when both are executed
   dout(30) << __func__ << " missing after" << get_parent()->get_log().get_missing().get_items() << dendl;

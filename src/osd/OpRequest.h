@@ -166,6 +166,8 @@ public:
 
   typedef boost::intrusive_ptr<OpRequest> Ref;
 
+  // selective dispatch
+  bool is_sr_op;
 private:
   void set_rmw_flags(int flags);
   void mark_flag_point(uint8_t flag, const char *s);

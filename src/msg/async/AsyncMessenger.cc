@@ -292,6 +292,9 @@ AsyncMessenger::AsyncMessenger(CephContext *cct, entity_name_t name,
   auto single = &cct->lookup_or_create_singleton_object<StackSingleton>(
     "AsyncMessenger::NetworkStack::" + transport_type, true, cct);
   single->ready(transport_type);
+  if (cct->_conf->osd_affinity_enable) {
+    single->stack->osd_whoami = name._num;
+  }
   stack = single->stack.get();
   stack->start();
   local_worker = stack->get_worker();
@@ -564,6 +567,9 @@ void AsyncMessenger::add_accept(Worker *w, ConnectedSocket cli_socket,
   lock.Lock();
   AsyncConnectionRef conn = new AsyncConnection(cct, this, &dispatch_queue, w,
 						listen_addr.is_msgr2(), false);
+  // selective dispatch test
+  ldout(cct, 0) << __func__ << " listen_addr " << listen_addr << " peer_addr "
+		<< peer_addr << " affinity " << w->cpu_affinity << dendl;
   conn->accept(std::move(cli_socket), listen_addr, peer_addr);
   accepting_conns.insert(conn);
   lock.Unlock();

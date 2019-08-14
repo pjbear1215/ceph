@@ -684,6 +684,8 @@ public:
   }
   void _failed_push(const hobject_t &hoid,
     pair<RecoveryMessages *, ECBackend::read_result_t &> &in);
+  // selective dispatch
+  void do_sd_entry () {}
 };
 ostream &operator<<(ostream &lhs, const ECBackend::pipeline_state_t &rhs);
 

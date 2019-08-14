@@ -1432,6 +1432,8 @@ protected:
     version_t *user_version,
     int *return_code) const;
   eversion_t projected_last_update;
+  // selective dispatch
+  eversion_t lastest_projected_last_update_sd;
   eversion_t get_next_version() const {
     eversion_t at_version(
       get_osdmap_epoch(),
@@ -1491,6 +1493,8 @@ protected:
 
   // abstract bits
   friend class FlushState;
+  // selective dispatch
+  friend class OSD;
 
   friend ostream& operator<<(ostream& out, const PG& pg);
 

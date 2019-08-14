@@ -64,6 +64,53 @@
 
 #define CEPH_OSD_PROTOCOL    10 /* cluster internal */
 
+// selective distpatch
+#define ENABLE_SELECTIVE_DISPATCH 1
+#define SD_ENTRY_FLUSH_THRESHOLD 10
+#define SD_ENTRY_KEEP_IN_MEMORY 10
+#define SD_PG_SEND_SIGNAL 5
+class sd_indicator {
+  public:
+    map< object_t, queue<uint64_t> > indicator;
+    uint64_t len;
+
+    bool is_buffered(object_t oid) {
+      auto p = indicator.find(oid);
+      if (p == indicator.end()) {
+	return false;
+      }
+      return true;
+    }
+    void add_entry(object_t oid, uint64_t seq) {
+      indicator[oid].push(seq);
+    }
+    void get_entries(object_t oid, queue<uint64_t> & entries) {
+      auto p = indicator.find(oid);
+      if (p == indicator.end()) {
+	return;
+      }
+      entries = p->second;
+      return;
+    }
+    void remove_entry(object_t oid, uint64_t seq) {
+      auto p = indicator.find(oid);
+      if (p == indicator.end()) {
+	return;
+      }
+      uint64_t delete_seq = p->second.front();
+      assert(delete_seq == seq);
+      p->second.pop();
+#if 0
+      auto t = p->second.find(seq);
+      if (t == p->second.end()) {
+	return;
+      } 
+      p->second.erase(t);
+#endif
+    }
+
+};
+
 /*
 
   lock ordering for pg map
@@ -270,6 +317,37 @@ public:
     con->send_message(m);
   }
   entity_name_t get_cluster_msgr_name() const;
+  // selective dispatch
+  void enqueue_sd_entry(object_t oid, spg_t pgid, uint64_t seq);
+  void sd_entry_flush(int index, bool need_flush, Mutex& sd_lock_local);
+  void send_signal_to_sd_queue(spg_t pgid) {
+    int sd_index = pgid.ps() % num_threads_sd;
+    assert(sd_conds[sd_index]);
+    if (cct->_conf->osd_affinity_enable) {
+      int cpu = sched_getcpu();
+      sd_index = cpu % num_threads_sd;
+    }
+    assert(sd_index < num_threads_sd);
+    sd_locks[sd_index]->Lock();
+    sd_conds[sd_index]->Signal();
+    sd_locks[sd_index]->Unlock();
+  }
+  uint64_t inc_sd_seq(spg_t pgid) {
+    int sd_index = pgid.ps() % num_threads_sd;
+    if (cct->_conf->osd_affinity_enable) {
+      int cpu = sched_getcpu();
+      sd_index = cpu % num_threads_sd;
+    }
+    return sd_seqs[sd_index]++;
+  }
+  uint64_t get_sd_seq(spg_t pgid) {
+    int sd_index = pgid.ps() % num_threads_sd;
+    if (cct->_conf->osd_affinity_enable) {
+      int cpu = sched_getcpu();
+      sd_index = cpu % num_threads_sd;
+    }
+    return sd_seqs[sd_index];
+  }
 
 private:
   // -- scrub scheduling --
@@ -384,9 +462,50 @@ private:
   Mutex agent_timer_lock;
   SafeTimer agent_timer;
 
+  // selective dispatch
+  // need to remove locks...
+#define NEED_FLUSH 1
+  struct sd_queue_entry {
+    object_t oid;
+    spg_t pgid;
+    uint64_t sd_seq;
+    uint64_t flag;
+  };
+  //vector< queue<pair<object_t, spg_t> > > sd_queue;
+  //queue<pair<object_t, spg_t> > sd_queue[NUM_OF_SD_THREAD];
+  struct SDThread : public Thread {
+  public:
+    OSDService *osd;
+    int index;
+    bool enable_affinity;
+    int cpu_affinity;
+    explicit SDThread(OSDService *o, int index) : osd(o), index(index) {}
+    void *entry() override {
+      if (enable_affinity) {
+	osd->set_sd_affinity(cpu_affinity);
+      }
+      osd->sd_entry(index);
+      return NULL;
+    }
+  };
+
 public:
+  vector< queue<struct sd_queue_entry > > sd_queue;
+  vector< struct SDThread * > sd_threads;
+  vector< bool > sd_stop_flag;
+  vector< Mutex * > sd_locks;
+  vector< Cond * > sd_conds;
+  vector< int > sd_seqs;
+  vector< sd_indicator *> sd_indicators;
+  vector <uint64_t> sd_queue_status;
+
   void agent_entry();
   void agent_stop();
+  // selective dispatch
+  void sd_entry(int);
+  void sd_entry_stop();
+  void set_sd_affinity(int cpu);
+  int num_threads_sd;
 
   void _enqueue(PG *pg, uint64_t priority) {
     if (!agent_queue.empty() &&
@@ -1116,6 +1235,10 @@ public:
   void update_log_config();
   void check_config();
 
+  // selective dispatch
+  void do_sd_entry_flush(OpRequestRef op);
+  void do_sd_process(spg_t pgid, OpRequestRef op);
+
 protected:
 
   const double OSD_TICK_INTERVAL = { 1.0 };
@@ -1162,6 +1285,9 @@ protected:
   class OSDSocketHook *asok_hook;
   bool asok_command(std::string_view admin_command, const cmdmap_t& cmdmap,
 		    std::string_view format, std::ostream& ss);
+  // selective dispatch
+  set<OpRequestRef> request_log;
+  time_t fake_timeout_interval, fake_suicide_interval;
 
 public:
   ClassHandler  *class_handler = nullptr;

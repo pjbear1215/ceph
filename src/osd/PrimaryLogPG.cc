@@ -1562,6 +1562,13 @@ void PrimaryLogPG::handle_backoff(OpRequestRef& op)
   session->ack_backoff(cct, m->pgid, m->id, begin, end);
 }
 
+// selective dispatch
+void PrimaryLogPG::do_sd_entry(object_t oid, spg_t pgid)
+{
+  dout(0) << __func__ << " invoke do_sd_entry() " << dendl;
+  pgbackend->do_sd_entry();
+}
+
 void PrimaryLogPG::do_request(
   OpRequestRef& op,
   ThreadPool::TPHandle &handle)
@@ -3706,6 +3713,27 @@ void PrimaryLogPG::promote_object(ObjectContextRef obc,
     });
 }
 
+#if 0
+// selective dispatch
+void PrimaryLogPG::make_sd_log(OpRequestRef op, ObjectContextRef obc)
+{
+  const MOSDOp *m = static_cast<const MOSDOp*>(op->get_req());
+  OpContext *ctx = new OpContext(op, m->get_reqid(), &m->ops, obc, this);
+  ctx->op_t.reset(new PGTransaction);
+  // do not support snap
+  ctx->snapc.seq = m->get_snap_seq();
+  ctx->snapc.snaps = m->get_snaps();
+  ctx->at_version = get_next_version();
+  ctx->mtime = m->get_mtime();
+  int result = prepare_transaction(ctx);
+  int result = do_osd_ops(ctx, *ctx->ops);
+  finish_ctx(ctx,
+	     ctx->new_obs.exists ? pg_log_entry_t::MODIFY :
+	     pg_log_entry_t::DELETE);
+
+}
+#endif
+
 void PrimaryLogPG::execute_ctx(OpContext *ctx)
 {
   FUNCTRACE(cct);
@@ -5398,6 +5426,10 @@ int PrimaryLogPG::do_read(OpContext *ctx, OSDOp& osd_op) {
   } else {
     int r = pgbackend->objects_read_sync(
       soid, op.extent.offset, op.extent.length, op.flags, &osd_op.outdata);
+
+    // selective disptch
+    // ToDo: overwrite recent data at offset
+
     // whole object?  can we verify the checksum?
     if (r >= 0 && op.extent.offset == 0 &&
         (uint64_t)r == oi.size && oi.is_data_digest()) {
@@ -10401,6 +10433,9 @@ void PrimaryLogPG::eval_repop(RepGather *repop)
     publish_stats_to_osd();
 
     dout(10) << " removing " << *repop << dendl;
+    // selective dispatch
+    // op can be completed instantly
+    if (!repop->op->is_sr_op)
     ceph_assert(!repop_queue.empty());
     dout(20) << "   q front is " << *repop_queue.front() << dendl; 
     if (repop_queue.front() == repop) {

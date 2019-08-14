@@ -17,6 +17,60 @@
 
 #include "PGBackend.h"
 
+// selective dispatch
+#define PRIMARY_SD_IO 1
+#define SECONDARY_SD_IO 2
+
+class sd_entry {
+public:
+  vector<ObjectStore::Transaction> tls;
+  OpRequestRef op;
+  spg_t pgid;
+  object_t oid;
+  int type;
+  eversion_t at_version;
+  uint64_t sd_seq;
+};
+
+#if 0
+class sd_indicator {
+public:
+  map< object_t, vector<uint64_t> > indicator;
+  uint64_t len;
+
+  bool is_buffered(object_t oid) {
+    auto p = indicator.find(oid);
+    if (p == indicator.end()) {
+      return false; 
+    }
+    return true;
+  }
+  void add_buffered_entry(object_t oid, uint64_t seq) {
+    indicator[oid].push_back(seq);
+  }
+  void get_buffered_entries(object_t oid, vector<uint64_t> & entries) {
+    auto p = indicator.find(oid);
+    if (p == indicator.end()) {
+      return;
+    }
+    entries = p.second;
+    return;
+  }
+  void remove_entry(object_t oid, uint64_t seq) {
+    auto p = indicator.find(oid);
+    if (p == indicator.end()) {
+      return;
+    }
+    auto t = p.second.find(seq);
+    if (t == p.second.end()) {
+      return;
+    }
+    p.second.erase(t);
+  }
+
+};
+#endif
+
 struct C_ReplicatedBackend_OnPullComplete;
 class ReplicatedBackend : public PGBackend {
   struct RPGHandle : public PGBackend::RecoveryHandle {
@@ -368,6 +422,14 @@ public:
     osd_reqid_t reqid,
     OpRequestRef op
     ) override;
+
+    // selective dispatch
+    queue<sd_entry*> sd_entries;
+    void sd_enqueue(sd_entry * entry, object_t oid);
+    sd_entry * sd_dequeue();
+    uint64_t inc_sd_seq();
+    uint64_t get_sd_seq();
+    void do_sd_entry() override;
 
 private:
   Message * generate_subop(

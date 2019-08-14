@@ -301,6 +301,11 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
      virtual void pg_add_num_bytes(int64_t num_bytes) = 0;
      virtual void pg_sub_num_bytes(int64_t num_bytes) = 0;
      virtual bool maybe_preempt_replica_scrub(const hobject_t& oid) = 0;
+     // selective dispatch
+     virtual void enqueue_sd_entry(object_t oid, spg_t pgid, uint64_t sd_seq) = 0;
+     virtual void send_signal_to_sd_queue(spg_t pgid) = 0;
+     virtual uint64_t inc_sd_seq(spg_t pgid) = 0;
+     virtual uint64_t get_sd_seq(spg_t pgid) = 0;
      virtual ~Listener() {}
    };
    Listener *parent;
@@ -320,6 +325,9 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
    std::ostream& gen_prefix(std::ostream& out) const {
      return parent->gen_dbg_prefix(out);
    }
+
+   // selective dispatch
+   virtual void do_sd_entry() = 0;
 
    /**
     * RecoveryHandle

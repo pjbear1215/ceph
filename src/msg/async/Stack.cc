@@ -44,10 +44,35 @@ std::function<void ()> NetworkStack::add_thread(unsigned i)
       const unsigned EventMaxWaitUs = 30000000;
       w->center.set_owner();
       ldout(cct, 10) << __func__ << " starting" << dendl;
+
+      if (cct->_conf->osd_affinity_enable) {
+	int cpu = w->cpu_affinity;
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	CPU_SET(cpu, &set);
+#if 0
+	if (sched_setaffinity(getpid(), sizeof(cpu_set_t), &set)) {
+	  ldout(cct, 0) << __func__ << " error occur during configuring affinity " << dendl;
+	}
+#endif
+	int s = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &set);
+        if (s != 0) {
+	  ldout(cct, 0) << __func__ << " error occur during configuring affinity " << dendl;
+	}
+	ldout(cct, 0) << __func__ << " pin this thread to cpu " << cpu << dendl;
+
+      }
+      //ldout(cct, 0) << __func__ << " omw process_events...." << dendl;
+
       w->initialize();
       w->init_done();
+      //ldout(cct, 0) << __func__ << " omw process_events...." << dendl;
       while (!w->done) {
         ldout(cct, 30) << __func__ << " calling event process" << dendl;
+        //ldout(cct, 0) << " omw debug process_events " << test << " affinity " << w->cpu_affinity << dendl;
+        ldout(cct, 0) << " omw debug process_events " <<  " affinity " << w->cpu_affinity 
+		      << " cur affinity " << sched_getcpu() << dendl;
+
 
         ceph::timespan dur;
         int r = w->center.process_events(EventMaxWaitUs, &dur);
@@ -117,6 +142,10 @@ NetworkStack::NetworkStack(CephContext *c, const string &t): type(t), started(fa
 
   for (unsigned i = 0; i < num_workers; ++i) {
     Worker *w = create_worker(cct, type, i);
+    if (cct->_conf->osd_affinity_enable) {
+      w->cpu_affinity = (osd_whoami % cct->_conf->osd_per_node) *
+				cct->_conf->osd_threads_sd + i;
+    }
     w->center.init(InitEventNumber, i, type);
     workers.push_back(w);
   }

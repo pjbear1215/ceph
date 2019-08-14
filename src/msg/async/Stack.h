@@ -232,6 +232,8 @@ class Worker {
   std::atomic_uint references;
   EventCenter center;
 
+  int cpu_affinity;
+
   Worker(const Worker&) = delete;
   Worker& operator=(const Worker&) = delete;
 
@@ -357,6 +359,8 @@ class NetworkStack {
 
   virtual bool is_ready() { return true; };
   virtual void ready() { };
+public:
+  int osd_whoami;
 };
 
 #endif //CEPH_MSG_ASYNC_STACK_H

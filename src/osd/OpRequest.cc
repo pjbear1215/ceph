@@ -49,6 +49,8 @@ OpRequest::OpRequest(Message* req, OpTracker* tracker)
     reqid = static_cast<MOSDRepOpReply*>(req)->reqid;
   }
   req_src_inst = req->get_source_inst();
+  // selective dispath
+  is_sr_op = false;
 }
 
 void OpRequest::_dump(Formatter *f) const
