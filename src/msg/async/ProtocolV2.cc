@@ -430,6 +430,129 @@ void ProtocolV2::send_message(Message *m) {
   }
 }
 
+void ProtocolV2::send_message_direct(Message *m) {
+  uint64_t f = connection->get_features();
+
+  // TODO: Currently not all messages supports reencode like MOSDMap, so here
+  // only let fast dispatch support messages prepare message
+  const bool can_fast_prepare = messenger->ms_can_fast_dispatch(m);
+  if (can_fast_prepare) {
+    prepare_send_message(f, m);
+  }
+
+  std::lock_guard<std::mutex> l(connection->write_lock);
+  bool is_prepared = can_fast_prepare;
+  // "features" changes will change the payload encoding
+  if (can_fast_prepare && (!can_write || connection->get_features() != f)) {
+    // ensure the correctness of message encoding
+    m->clear_payload();
+    is_prepared = false;
+    ldout(cct, 10) << __func__ << " clear encoded buffer previous " << f
+                   << " != " << connection->get_features() << dendl;
+  }
+  if (state == CLOSED) {
+    ldout(cct, 10) << __func__ << " connection closed."
+                   << " Drop message " << m << dendl;
+    m->put();
+  } else {
+    ldout(cct, 5) << __func__ << " enqueueing message m=" << m
+                  << " type=" << m->get_type() << " " << *m << dendl;
+    m->queue_start = ceph::mono_clock::now();
+    m->trace.event("async enqueueing message");
+    out_queue[m->get_priority()].emplace_back(
+      out_queue_entry_t{is_prepared, m});
+    ldout(cct, 15) << __func__ << " inline write is denied, reschedule m=" << m
+                   << dendl;
+    // direct send
+    if (((!replacing && can_write) || state == STANDBY) && !write_in_progress) {
+      write_in_progress = true;
+    }
+    {
+      if (can_write) {
+	bool more;
+	int direct_cnt = 0;
+	int r;
+	do {
+	  const auto out_entry = _get_next_outgoing();
+	  if (!out_entry.m) {
+	    break;
+	  }
+	  if (!connection->policy.lossy) {
+	    // put on sent list
+	    sent.push_back(out_entry.m);
+	    out_entry.m->get();
+	  }
+	  more = !out_queue.empty();
+	  // send_message or requeue messages may not encode message
+	  if (!out_entry.is_prepared) {
+	    prepare_send_message(connection->get_features(), out_entry.m);
+	  }
+
+#if 0
+	  if (out_entry.m->queue_start != ceph::mono_time()) {
+	    connection->logger->tinc(l_msgr_send_messages_queue_lat,
+				     ceph::mono_clock::now() -
+				     out_entry.m->queue_start);
+	  }
+#endif
+
+	  r = write_message_direct(out_entry.m, more);
+	  if (r == 0) {
+	    ;
+	  } else if (r < 0) {
+	    ldout(cct, 1) << __func__ << " send msg failed" << dendl;
+	    break;
+	  } else if (r > 0) {
+	    // Outbound message in-progress, thread will be re-awoken
+	    // when the outbound socket is writeable again
+	    break;
+	  }
+	  direct_cnt++;
+	} while (can_write);
+	write_in_progress = false;
+
+	//ldout(cct, 0) << __func__ << " direct cnt " << direct_cnt << dendl;
+	if (r == 0) {
+	  uint64_t left = ack_left;
+	  if (left) {
+	    auto ack = AckFrame::Encode(in_seq);
+	    connection->outcoming_bl.append(ack.get_buffer(session_stream_handlers));
+	    ldout(cct, 0) << __func__ << " try send msg ack, acked " << left
+			   << " messages" << dendl;
+	    ack_left -= left;
+	    left = ack_left;
+	    r = connection->_try_send_direct(left);
+	  } else if (is_queued()) {
+	    r = connection->_try_send_direct();
+	  }
+	}
+	if (r < 0) {
+	  ldout(cct, 1) << __func__ << " send msg failed" << dendl;
+	  connection->write_lock.unlock();
+	  connection->lock.lock();
+	  fault();
+	  connection->lock.unlock();
+	  return;
+	}
+
+      } else {
+	  if (((!replacing && can_write) || state == STANDBY) && !write_in_progress) {
+	    write_in_progress = true;
+	    connection->center->dispatch_event_external(connection->write_handler);
+	  }
+#
+      }
+    }
+
+#if 0
+    if (((!replacing && can_write) || state == STANDBY) && !write_in_progress) {
+      write_in_progress = true;
+      connection->center->dispatch_event_external(connection->write_handler);
+    }
+#endif
+  }
+}
+
 void ProtocolV2::send_keepalive() {
   ldout(cct, 10) << __func__ << dendl;
   std::lock_guard<std::mutex> l(connection->write_lock);
@@ -480,6 +603,66 @@ ProtocolV2::out_queue_entry_t ProtocolV2::_get_next_outgoing() {
     }
   }
   return out_entry;
+}
+
+ssize_t ProtocolV2::write_message_direct(Message *m, bool more) {
+  FUNCTRACE(cct);
+  // warning selective dispatch
+  //ceph_assert(connection->center->in_thread());
+  m->set_seq(++out_seq);
+
+  connection->lock.lock();
+  uint64_t ack_seq = in_seq;
+  ack_left = 0;
+  connection->lock.unlock();
+
+  ceph_msg_header &header = m->get_header();
+  ceph_msg_footer &footer = m->get_footer();
+
+  ceph_msg_header2 header2{header.seq,        header.tid,
+                           header.type,       header.priority,
+                           header.version,
+                           0,                 header.data_off,
+                           ack_seq,
+                           footer.flags,      header.compat_version,
+                           header.reserved};
+
+  auto message = MessageFrame::Encode(
+			     header2,
+			     m->get_payload(),
+			     m->get_middle(),
+			     m->get_data());
+  connection->outcoming_bl.append(message.get_buffer(session_stream_handlers));
+
+  ldout(cct, 5) << __func__ << " sending message m=" << m
+                << " seq=" << m->get_seq() << " " << *m << dendl;
+
+  m->trace.event("async writing message");
+  ldout(cct, 20) << __func__ << " sending m=" << m << " seq=" << m->get_seq()
+                 << " src=" << entity_name_t(messenger->get_myname())
+                 << " off=" << header2.data_off
+                 << dendl;
+  ssize_t total_send_size = connection->outcoming_bl.length();
+  ssize_t rc = connection->_try_send_direct(more);
+  if (rc < 0) {
+    ldout(cct, 1) << __func__ << " error sending " << m << ", "
+                  << cpp_strerror(rc) << dendl;
+  } else {
+    connection->logger->inc(
+        l_msgr_send_bytes, total_send_size - connection->outcoming_bl.length());
+    ldout(cct, 10) << __func__ << " sending " << m
+                   << (rc ? " continuely." : " done.") << dendl;
+  }
+
+#if defined(WITH_LTTNG) && defined(WITH_EVENTTRACE)
+  if (m->get_type() == CEPH_MSG_OSD_OP)
+    OID_EVENT_TRACE_WITH_MSG(m, "SEND_MSG_OSD_OP_END", false);
+  else if (m->get_type() == CEPH_MSG_OSD_OPREPLY)
+    OID_EVENT_TRACE_WITH_MSG(m, "SEND_MSG_OSD_OPREPLY_END", false);
+#endif
+  m->put();
+
+  return rc;
 }
 
 ssize_t ProtocolV2::write_message(Message *m, bool more) {

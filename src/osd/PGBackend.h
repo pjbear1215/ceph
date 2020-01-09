@@ -155,6 +155,21 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
        vector<ObjectStore::Transaction>& tls,
        OpRequestRef op = OpRequestRef()
        ) = 0;
+     virtual void queue_transaction_thin(
+       ObjectStore::Transaction&& t,
+       OpRequestRef op = OpRequestRef(),
+       bool thinstore_enable = true
+       ) {}
+     virtual void queue_transactions_thin(
+       vector<ObjectStore::Transaction>& tls,
+       OpRequestRef op = OpRequestRef(),
+       bool thinstore_enable = true
+       ) {}
+     virtual void queue_transactions_thin_batch(
+       vector<struct sd_entry*> ops_list,
+       OpRequestRef op = OpRequestRef(),
+       bool thinstore_enable = true
+       ) {}
      virtual epoch_t get_interval_start_epoch() const = 0;
      virtual epoch_t get_last_peering_reset_epoch() const = 0;
 
@@ -277,6 +292,9 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
 
      virtual void send_message_osd_cluster(
        int peer, Message *m, epoch_t from_epoch) = 0;
+     // selective dispath
+     virtual void send_message_osd_cluster_direct(
+       int peer, Message *m, epoch_t from_epoch) {};
      virtual void send_message_osd_cluster(
        Message *m, Connection *con) = 0;
      virtual void send_message_osd_cluster(
@@ -306,6 +324,7 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
      virtual void send_signal_to_sd_queue(spg_t pgid) = 0;
      virtual uint64_t inc_sd_seq(spg_t pgid) = 0;
      virtual uint64_t get_sd_seq(spg_t pgid) = 0;
+     virtual ObjectStore* get_thinstore() = 0;
      virtual ~Listener() {}
    };
    Listener *parent;
@@ -464,6 +483,21 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
      OpRequestRef op                      ///< [in] op
      ) = 0;
 
+   // selective dispatch
+   virtual void fast_submit_transaction(
+       const hobject_t &soid,
+       //const object_stat_sum_t &delta_stats,
+       const eversion_t &at_version,
+       PGTransactionUPtr &&_t,
+       //const eversion_t &trim_to,
+       //const eversion_t &roll_forward_to,
+       const vector<pg_log_entry_t> &_log_entries,
+       //std::optional<pg_hit_set_history_t> &hset_history,
+       //Context *on_all_commit,
+       //ceph_tid_t tid,
+       osd_reqid_t reqid,
+       OpRequestRef orig_op){}
+
    /// submit callback to be called in order with pending writes
    virtual void call_write_ordered(std::function<void(void)> &&cb) = 0;
 
@@ -568,6 +602,14 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
      uint64_t len,
      uint32_t op_flags,
      bufferlist *bl) = 0;
+
+   virtual int objects_read_sync(
+     const hobject_t &hoid,
+     uint64_t off,
+     uint64_t len,
+     uint32_t op_flags,
+     bufferlist *bl,
+     int sd_index) { return 0; }
 
    virtual void objects_read_async(
      const hobject_t &hoid,

@@ -135,6 +135,14 @@ public:
     std::vector<std::pair<OmapUpdateType, bufferlist> > omap_updates;
 
     std::optional<bufferlist> omap_header;
+    // selective dispatch
+    //std::optional<bufferlist> fast_io_list;
+    std::map<string, std::optional<bufferlist> > fast_io_list;
+    struct WriteUpdate {
+      uint64_t offset;
+      uint64_t len;
+    };
+    WriteUpdate fast_io_write;
 
     /// (old, new) -- only valid with no truncate or buffer updates
     std::optional<pair<set<snapid_t>, set<snapid_t> > > updated_snaps;
@@ -415,6 +423,24 @@ public:
       len,
       ObjectOperation::BufferUpdate::Write{bl, fadvise_flags});
   }
+
+  /// Buffer updates
+  void fast_write(
+    const hobject_t &hoid,         ///< [in] object to write
+    uint64_t off,                  ///< [in] off at which to write
+    uint64_t len,                  ///< [in] len to write from bl
+    bufferlist &bl,                ///< [in] bl to write will be claimed to len
+    uint32_t fadvise_flags = 0     ///< [in] fadvise hint
+    ) {
+    auto &op = get_object_op_for_modify(hoid);
+    ceph_assert(!op.updated_snaps);
+    ceph_assert(len > 0);
+    ceph_assert(len == bl.length());
+    op.fast_io_list[hoid.oid.name] = bl;
+    op.fast_io_write.offset = off;
+    op.fast_io_write.len = len;
+  }
+
   void clone_range(
     const hobject_t &from,         ///< [in] from
     const hobject_t &to,           ///< [in] to

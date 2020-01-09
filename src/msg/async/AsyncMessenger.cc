@@ -294,6 +294,11 @@ AsyncMessenger::AsyncMessenger(CephContext *cct, entity_name_t name,
   single->ready(transport_type);
   if (cct->_conf->osd_affinity_enable) {
     single->stack->osd_whoami = name._num;
+    single->stack->whoami_name = name;
+    if (name.is_osd()) {
+      single->stack->is_osd = true;
+    }
+    this->mname = mname;
   }
   stack = single->stack.get();
   stack->start();
@@ -569,7 +574,9 @@ void AsyncMessenger::add_accept(Worker *w, ConnectedSocket cli_socket,
 						listen_addr.is_msgr2(), false);
   // selective dispatch test
   ldout(cct, 0) << __func__ << " listen_addr " << listen_addr << " peer_addr "
-		<< peer_addr << " affinity " << w->cpu_affinity << dendl;
+		<< peer_addr << " affinity " << w->cpu_affinity 
+		<< " is osd " << conn->peer_is_osd() << " type " << this->mname
+		<< dendl;
   conn->accept(std::move(cli_socket), listen_addr, peer_addr);
   accepting_conns.insert(conn);
   lock.Unlock();
@@ -604,6 +611,11 @@ AsyncConnectionRef AsyncMessenger::create_connect(
   ceph_assert(!conns.count(addrs));
   ldout(cct, 10) << __func__ << " " << conn << " " << addrs << " "
 		 << *conn->peer_addrs << dendl;
+  // selective dispath for debug
+  ldout(cct, 0) << __func__ << " " << conn << " " << addrs << " "
+		 << *conn->peer_addrs << " is osd " << conn->peer_is_osd() 
+		 << " affinity " << w->cpu_affinity << " type " << this->mname << dendl;
+
   conns[addrs] = conn;
   w->get_perf_counter()->inc(l_msgr_active_connections);
 

@@ -303,11 +303,17 @@ OSDService::OSDService(OSD *osd) :
     sd_locks.push_back(new Mutex("OSDService::sd_mutex"));
     sd_conds.push_back(new Cond);
     sd_stop_flag.push_back(false);
-    sd_queue.push_back( queue<struct sd_queue_entry>() );
+    sd_queue.push_back( list<struct sd_queue_entry>() );
     sd_seqs.push_back(0);
     sd_indicators.push_back(new sd_indicator);
     sd_queue_status.push_back(0);
   }
+
+  for (int j = 0; j < cct->_conf->osd_threads_sd * 2; j++) {
+    sd_cache_ops_locks.push_back(new Mutex("OSDSer::cache_ops_lock"));
+  }
+
+  sd_q_policy = cct->_conf->sd_q_policy;
 }
 
 OSDService::~OSDService()
@@ -331,6 +337,9 @@ OSDService::~OSDService()
   }
   for (auto m : sd_indicators) {
     delete m;
+  }
+  for (auto p : sd_cache_ops_locks) {
+    delete p;
   }
 }
 
@@ -603,31 +612,142 @@ void OSDService::set_sd_affinity(int cpu)
   }
 }
 
-void OSDService::enqueue_sd_entry(object_t oid, spg_t pgid, uint64_t seq) 
+ObjectStore * OSDService::get_thinstore() 
+{
+  return osd->thinstore;
+}
+
+void OSDService::enqueue_sd_entry(object_t oid, spg_t pgid, uint64_t seq, OpRequestRef op, 
+				  ObjectStore::Transaction *op_t, PrimaryLogPG *plpg) 
 {
   int sd_index = pgid.ps() % num_threads_sd;
   if (cct->_conf->osd_affinity_enable) {
     int cpu = sched_getcpu();
-    sd_index = cpu % num_threads_sd;
+    // for performance
+    // need check !!!!!!!!!!!!!!!!
+    // need check !!!!!!!!!!!!!!!!
+    // need check !!!!!!!!!!!!!!!!
+    // need check !!!!!!!!!!!!!!!!
+    // need check !!!!!!!!!!!!!!!!
+    // need check !!!!!!!!!!!!!!!!
+    // need check !!!!!!!!!!!!!!!!
+    // need check !!!!!!!!!!!!!!!!
+    // need check !!!!!!!!!!!!!!!!
+    // need check !!!!!!!!!!!!!!!!
+    //sd_index = cpu % num_threads_sd;
+    if (sd_index == 0 || sd_index == 1) {
+      sd_index += 2;
+    }
     // ToDo
     // locality
-    sd_index = cpu;
+    // sd_index = cpu;
+#if 0
     dout(0) << __func__ << " local cpu " << cpu << " to sd_index: " 
-	    << sd_index << dendl;
+	    << sd_index << " num_threads_sd " << num_threads_sd << dendl;
+#endif
   }
-  assert(sd_index < num_threads_sd);
+  ceph_assert(sd_index < num_threads_sd);
+  ceph_assert(sd_index >= 0);
   // ToDo
   // lock can be removed..
   sd_locks[sd_index]->Lock();
 
+  // is this read op?
+  bool is_read = false;
+  Message *m = NULL;
+  if (op) {
+    m = op->get_nonconst_req();
+  }
+
+  if (m) {
+    //dout(0) << __func__ << " messge " << *m << dendl;
+  } else {
+    //dout(0) << __func__ << " messge is null ? " << dendl;
+  }
+
+  if (op && m->get_type() == CEPH_MSG_OSD_OP &&  op->may_read()) {
+    // find prior write
+    bool found = false;
+    is_read = true;
+    hobject_t hoid;
+    MOSDOp *op_m = NULL;
+    ceph_assert(m->get_type() == CEPH_MSG_OSD_OP);
+    for (auto p : sd_queue[sd_index]) {
+      Message * p_op_m = p.op->get_nonconst_req();
+      if (p_op_m->get_type() == MSG_OSD_REPOP) {
+	continue;
+      }
+#if 0
+      dout(0) << __func__ << " p.op message " << *m << " size " 
+	      << sd_queue[sd_index].size() << dendl;
+      dout(0) << __func__ << " p.oid " << p.oid << " size " 
+	      << sd_queue[sd_index].size() << dendl;
+#endif
+      ceph_assert(p.op);
+      op_m = static_cast<MOSDOp*>(p.op->get_nonconst_req());
+      ceph_assert(op_m);
+      hoid = op_m->get_hobj().get_head();
+      if (p.oid == hoid.oid) {
+	found = true;
+	break;
+      }
+    }
+    // no write request, so just return the reply
+    if (!found) {
+      ceph_assert(plpg);
+      op_m = static_cast<MOSDOp*>(op->get_nonconst_req());
+      ceph_assert(op_m);
+      ceph_assert(op_m->ops.size() == 1);
+      hoid = op_m->get_hobj().get_head();
+      plpg->fast_fast_do_osd_ops(hoid, op_m->ops, NULL, op, sd_index);
+      sd_locks[sd_index]->Unlock();
+      return;
+    }
+  }
+
   struct sd_queue_entry en;
-  en.oid = oid;
   en.pgid = pgid;
   en.sd_seq = seq;
-  sd_queue[sd_index].push(en);
-  // if indicator is enabled
-  sd_indicators[sd_index]->add_entry(oid, seq);
+  if (!seq) {
+    en.sd_seq = inc_sd_seq(pgid, sd_index);
+  }
 
+  if (op) {
+    if (m->get_type() == CEPH_MSG_OSD_OP) {
+      MOSDOp *op_m = static_cast<MOSDOp*>(op->get_nonconst_req());
+      hobject_t hoid = op_m->get_hobj().get_head();
+      en.oid = hoid.oid;
+    }
+    en.op = op;
+  } else {
+    en.oid = oid;
+    en.op = NULL;
+    dout(0) << __func__ << " warning op is null " << dendl;
+  }
+
+  if (op_t) {
+    en.op_t = op_t;
+  } else {
+    en.op_t = NULL;
+  }
+  sd_queue[sd_index].push_back(en);
+  // if indicator is enabled
+  if (sd_q_policy == SD_ENABLE_FLUSH_Q) {
+    // disable indicator
+    // need ?
+    if (sd_queue[sd_index].size() > SD_ENTRY_KEEP_IN_MEMORY) {
+      if (!(sd_queue_status[sd_index] & SEND_SIGNAL)) {
+	send_signal_to_sd_queue_wo_lock(pgid, sd_index);
+	sd_queue_status[sd_index] |= SEND_SIGNAL;
+      }
+    }
+    if (is_read) {
+      sd_queue_status[sd_index] |= NEED_FLUSH;
+      send_signal_to_sd_queue_wo_lock(pgid, sd_index);
+    }
+  } else {
+    sd_indicators[sd_index]->add_entry(oid, seq);
+  }
   sd_locks[sd_index]->Unlock();
 }
 
@@ -641,21 +761,21 @@ void OSDService::sd_entry_flush(int index, bool need_flush, Mutex& sd_lock_local
     }
     while (flush_size > 0 && sd_queue[index].size() > 0) {
       struct sd_queue_entry flush_entry = sd_queue[index].front();
-      sd_queue[index].pop();
+      sd_queue[index].pop_front();
       // if indicator is enabled
       sd_indicators[index]->remove_entry(flush_entry.oid, flush_entry.sd_seq);
 
       sd_lock_local.Unlock();
 
       uint32_t shard_index = flush_entry.pgid.hash_to_shard(osd->num_shards);
-      dout(0) << __func__ << " " << __LINE__ << " shard_index " << shard_index 
+      dout(30) << __func__ << " " << __LINE__ << " shard_index " << shard_index 
 	      << " oid " << flush_entry.oid << " spg_t " << flush_entry.pgid
 	      << " queue size " << sd_queue[index].size() 
 	      << " cur index " << index 
 	      << " cur cpu " << sched_getcpu() << dendl;
       auto sdata = osd->shards[shard_index];
-      assert(sdata);
-      assert(osdmap->get_epoch() <= sdata->shard_osdmap->get_epoch());
+      ceph_assert(sdata);
+      ceph_assert(osdmap->get_epoch() <= sdata->shard_osdmap->get_epoch());
       auto t = sdata->pg_slots.find(flush_entry.pgid);
       assert(t != sdata->pg_slots.end());
 #if 0
@@ -666,21 +786,67 @@ void OSDService::sd_entry_flush(int index, bool need_flush, Mutex& sd_lock_local
       //OSDShardPGSlot *slot = r.first->second.get();
 #endif
       OSDShardPGSlot *slot = t->second.get();
-      assert(slot);
+      ceph_assert(slot);
       PGRef pg = slot->pg;
-      assert(pg);
+      ceph_assert(pg);
       PG* pg_ref = pg.get();
       PrimaryLogPG* plpg = static_cast<PrimaryLogPG*>(pg_ref);
-      assert(plpg);
-      plpg->lock();
-      plpg->do_sd_entry(flush_entry.oid, flush_entry.pgid);
-      plpg->unlock();
+      ceph_assert(plpg);
+      bool with_lock = false;
+      if (with_lock) {
+	plpg->lock();
+	if (sd_q_policy == SD_ENABLE_FLUSH_Q) {
+	  heartbeat_handle_d hhd("test");
+	  time_t timeout_interval, suicide_interval;
+	  ThreadPool::TPHandle tp_handle(cct, &hhd, osd->fake_timeout_interval,
+					 osd->fake_suicide_interval);
+	  if (cct->_conf->front_ack_backend_do_nothing) {
+	    plpg->do_request(flush_entry.op, tp_handle);
+	  } else if (flush_entry.op->sr_type == FRONT_ACK_BACKEND_DO_FLUSH &&
+		     cct->_conf->front_ack_backend_do_flush) {
+	    plpg->fast_do_request(flush_entry.op, tp_handle, &flush_entry);
+	  } else {
+	    plpg->do_request(flush_entry.op, tp_handle);
+	  }
+	  //flush_entry.op = NULL;
+	} else {
+	  plpg->do_sd_entry(flush_entry.oid, flush_entry.pgid);
+	}
+	plpg->unlock();
+      } else {
+	if (sd_q_policy == SD_ENABLE_FLUSH_Q) {
+	  heartbeat_handle_d hhd("test");
+	  time_t timeout_interval, suicide_interval;
+	  ThreadPool::TPHandle tp_handle(cct, &hhd, osd->fake_timeout_interval,
+					 osd->fake_suicide_interval);
+	  if (cct->_conf->front_ack_backend_do_nothing) {
+	    plpg->lock();
+	    plpg->do_request(flush_entry.op, tp_handle);
+	    plpg->unlock();
+	  } else if (flush_entry.op->sr_type == FRONT_ACK_BACKEND_DO_FLUSH &&
+		     cct->_conf->front_ack_backend_do_flush) {
+	    plpg->fast_do_request(flush_entry.op, tp_handle, &flush_entry);
+	    if (flush_entry.op_t) {
+	      delete flush_entry.op_t;
+	    }
+	  } else {
+	    plpg->lock();
+	    plpg->do_request(flush_entry.op, tp_handle);
+	    plpg->unlock();
+	  }
+	} else {
+	  plpg->lock();
+	  plpg->do_sd_entry(flush_entry.oid, flush_entry.pgid);
+	  plpg->unlock();
+	}
+      }
       flush_size--;
 
       sd_lock_local.Lock();
       if (sd_queue[index].size() == 0) {
 	sd_queue_status[index] = (sd_queue_status[index] & ~NEED_FLUSH);
       }
+      sd_queue_status[index] = (sd_queue_status[index] & ~SEND_SIGNAL);
     }
   }
 #if 0
@@ -692,6 +858,177 @@ void OSDService::sd_entry_flush(int index, bool need_flush, Mutex& sd_lock_local
 #endif
 }
 
+void OSDService::sd_merge_entry_flush(int index, bool need_flush, Mutex& sd_lock_local)
+{
+
+  //ceph_assert(index == sched_getcpu());
+  if (sd_queue[index].size() >= SD_ENTRY_FLUSH_THRESHOLD) {
+    int flush_size = 1000;
+    if (need_flush) {
+      flush_size = sd_queue[index].size();
+    }
+    vector< struct sd_queue_entry > sd_entry_list;
+    while (flush_size > 0 && sd_queue[index].size() > 0) {
+      sd_entry_list.push_back(sd_queue[index].front());
+      sd_queue[index].pop_front();
+      // if indicator is enabled
+      //sd_indicators[index]->remove_entry(flush_entry.oid, flush_entry.sd_seq);
+      flush_size--;
+    }
+
+    if (sd_queue[index].size() > 0) {
+      dout(0) << __func__ << " warning still sd_queue contains entries " << dendl;
+    }
+
+    sd_lock_local.Unlock();
+
+    ceph_assert(sd_entry_list.size());
+    if (sd_entry_list.size() > (SD_ENTRY_KEEP_IN_MEMORY << 1) + 1) {
+      dout(0) << __func__ << " sd_entry_list size is too big !! " 
+	      << sd_entry_list.size() << dendl;
+    }
+
+    struct sd_queue_entry flush_entry = sd_entry_list.front();
+    if (!flush_entry.op) {
+      dout(0) << __func__ << " " << __LINE__ 
+	      << " oid " << flush_entry.oid << " spg_t " << flush_entry.pgid
+	      << dendl;
+    }
+    ceph_assert(flush_entry.op);
+    if (flush_entry.op->sr_type != FRONT_ACK_BACKEND_DO_FLUSH ||
+	!cct->_conf->front_ack_backend_do_flush) {
+      Message * m = flush_entry.op->get_nonconst_req();
+      dout(0) << __func__ << " length " << m->get_data_len() <<  " req id " 
+	      << flush_entry.op->get_reqid() << dendl;
+      ceph_assert(0);
+    }
+
+    uint32_t shard_index = flush_entry.pgid.hash_to_shard(osd->num_shards);
+    dout(30) << __func__ << " " << __LINE__ << " shard_index " << shard_index 
+	    << " oid " << flush_entry.oid << " spg_t " << flush_entry.pgid
+	    << " queue size " << sd_queue[index].size() 
+	    << " cur index " << index 
+	    << " cur cpu " << sched_getcpu() << dendl;
+    auto sdata = osd->shards[shard_index];
+    ceph_assert(sdata);
+    ceph_assert(osdmap->get_epoch() <= sdata->shard_osdmap->get_epoch());
+    auto t = sdata->pg_slots.find(flush_entry.pgid);
+    if (t == sdata->pg_slots.end()) {
+      dout(0) << __func__ << " " << __LINE__ << " shard_index " << shard_index 
+	      << " oid " << flush_entry.oid << " spg_t " << flush_entry.pgid
+	      << " queue size " << sd_queue[index].size() 
+	      << " cur index " << index 
+	      << " cur cpu " << sched_getcpu() << dendl;
+    }
+    assert(t != sdata->pg_slots.end());
+
+    OSDShardPGSlot *slot = t->second.get();
+    ceph_assert(slot);
+    PGRef pg = slot->pg;
+    ceph_assert(pg);
+    PG* pg_ref = pg.get();
+    PrimaryLogPG* plpg = static_cast<PrimaryLogPG*>(pg_ref);
+    ceph_assert(plpg);
+    bool with_lock = false;
+    if (with_lock) {
+      plpg->lock();
+      sd_merge_entry(&sd_entry_list, index, plpg);
+      plpg->unlock();
+    } else {
+      sd_merge_entry(&sd_entry_list, index, plpg);
+    }
+    flush_size--;
+
+    sd_lock_local.Lock();
+    if (sd_queue[index].size() == 0) {
+      sd_queue_status[index] = (sd_queue_status[index] & ~NEED_FLUSH);
+    }
+    sd_queue_status[index] = (sd_queue_status[index] & ~SEND_SIGNAL);
+  }
+}
+
+void OSDService::sd_merge_entry(vector<struct sd_queue_entry> * list, int sd_index, PrimaryLogPG* plpg)
+{
+  vector< struct sd_entry *> ops_list;
+  vector< struct sd_queue_entry > read_ops;
+
+  for (auto p : *list) {
+    if (p.processed) {
+      continue;
+    }
+    ceph_assert(p.op);
+    Message * m = p.op->get_nonconst_req();
+
+    dout(0) << __func__ << " sequence " << *m << dendl;
+
+    if (p.op && m->get_type() == CEPH_MSG_OSD_OP && p.op->may_read()) {
+      dout(0) << __func__ << " this is read op " << p.oid << dendl;
+      read_ops.push_back(p);
+      p.processed = true;
+      continue;
+    }
+
+    struct sd_entry * en = new struct sd_entry;
+    uint64_t new_sd_seq = inc_sd_seq((*list)[0].pgid);
+
+    en->op = p.op;
+
+    // need affinity based on thread and parition context, not pgid
+    if (cct->_conf->osd_affinity_enable) {
+      //en->op->sd_index = sched_getcpu() % cct->_conf->osd_threads_sd;
+      en->op->sd_index = sd_index;
+    } else {
+      en->op->sd_index = -1;
+    }
+    ceph_assert(en->op->sd_index == sd_index);
+    en->pgid = p.pgid;
+    en->oid = p.oid;
+    if (m->get_type() == CEPH_MSG_OSD_OP) {
+      ceph_assert(p.op_t);
+      en->type = PRIMARY_SD_IO;
+      en->tls.push_back(std::move(*(p.op_t)));
+    } else if (m->get_type() == MSG_OSD_REPOP) {
+      static_cast<MOSDRepOp*>(en->op->get_nonconst_req())->finish_decode();
+      const MOSDRepOp *rep_m = static_cast<const MOSDRepOp *>(en->op->get_req());
+      auto da = const_cast<bufferlist&>(rep_m->get_data()).cbegin();
+      ObjectStore::Transaction opt;
+      en->type = SECONDARY_SD_IO;
+      decode(opt, da);
+      en->tls.reserve(1);
+      en->tls.push_back(std::move(opt));
+    }
+    //en.at_version = ctx->at_version;
+    //en.at_version = get_next_version();
+    en->sd_seq = new_sd_seq;
+
+    ops_list.push_back(en);
+    p.processed = true;
+    if (p.op_t) {
+      delete p.op_t;
+    }
+  }
+
+  ceph_assert(ops_list.size());
+  ceph_assert(osd->thinstore);
+  //osd->thinstore->queue_transactions(ops_list, ops_list[0]->op, true);
+  plpg->queue_transactions_thin_batch(ops_list, ops_list[0]->op, true);
+
+  // read ops ? have to flush prior writes before processing read
+  for (auto p : read_ops) {
+    Message * m = p.op->get_nonconst_req();
+    ceph_assert(m->get_type() == CEPH_MSG_OSD_OP);
+    MOSDOp *op_m = static_cast<MOSDOp*>(p.op->get_nonconst_req());
+    ceph_assert(op_m);
+    hobject_t hoid = op_m->get_hobj().get_head();
+    dout(0) << __func__ << " delayed read " << hoid << dendl;
+    plpg->fast_fast_do_osd_ops(hoid, op_m->ops, NULL, p.op, sd_index);
+  }
+
+  for (auto p : ops_list) {
+    delete p;
+  }
+}
+
 void OSDService::sd_entry(int index)
 {
   Mutex &sd_lock_local = *(sd_locks[index]);
@@ -701,25 +1038,31 @@ void OSDService::sd_entry(int index)
     if (sd_queue[index].empty()) {
       dout(20) << __func__ << " empty queue" << dendl;
       sd_conds[index]->Wait(sd_lock_local);
-      dout(0) << __func__ << " wake up, the size is " 
-	      << sd_queue[index].size() << dendl;
       continue;
-    } else if (sd_queue_status[index] == NEED_FLUSH) {
+    } else if (sd_queue_status[index] & NEED_FLUSH) {
       dout(0) << __func__ << " need immediatly flush " << dendl;
     } else if (sd_queue[index].size() < SD_ENTRY_KEEP_IN_MEMORY) {
       dout(0) << __func__ << " warning... the size of queue " 
 	      << sd_queue[index].size() << dendl;
       sd_conds[index]->Wait(sd_lock_local);
+#if 0
       dout(0) << __func__ << " wake up 2, the size is " 
 	      << sd_queue[index].size() << dendl;
+#endif
       continue;
     }
 
-    dout(0) << __func__ << " current size is " 
+#if 0
+    dout(30) << __func__ << " current size is " 
 	    << sd_queue[index].size() 
 	    << " is locked? " << sd_lock_local.is_locked() 
 	    << dendl;
-    sd_entry_flush(index, false, sd_lock_local);
+#endif
+    if (!cct->_conf->osd_level_batch_flush) {
+      sd_entry_flush(index, false, sd_lock_local);
+    } else {
+      sd_merge_entry_flush(index, false, sd_lock_local);
+    }
   }
 }
 
@@ -1211,6 +1554,26 @@ void OSDService::send_message_osd_cluster(int peer, Message *m, epoch_t from_epo
     next_map->get_cluster_addrs(peer));
   maybe_share_map(peer_con.get(), next_map);
   peer_con->send_message(m);
+  release_map(next_map);
+}
+
+// selective dispath
+void OSDService::send_message_osd_cluster_direct(int peer, Message *m, epoch_t from_epoch)
+{
+  OSDMapRef next_map = get_nextmap_reserved();
+  // service map is always newer/newest
+  ceph_assert(from_epoch <= next_map->get_epoch());
+
+  if (next_map->is_down(peer) ||
+      next_map->get_info(peer).up_from > from_epoch) {
+    m->put();
+    release_map(next_map);
+    return;
+  }
+  ConnectionRef peer_con = osd->cluster_messenger->connect_to_osd(
+    next_map->get_cluster_addrs(peer));
+  maybe_share_map(peer_con.get(), next_map);
+  peer_con->send_message_direct(m);
   release_map(next_map);
 }
 
@@ -2383,6 +2746,11 @@ OSD::OSD(CephContext *cct_, ObjectStore *store_,
       cct->_conf->osd_op_pq_min_cost,
       op_queue);
     shards.push_back(one_shard);
+  }
+
+  // selective dispatch
+  for (int j = 0; j < cct->_conf->osd_threads_sd * 2; j++) {
+    cache_ops.push_back( map <osd_reqid_t, OpRequestRef>() ) ;
   }
 }
 
@@ -7186,32 +7554,35 @@ void OSD::ms_fast_dispatch(Message *m)
 	 m->get_type() == MSG_OSD_REPOP || m->get_type() == MSG_OSD_REPOPREPLY)
 	&& cct->_conf->osd_selective_dispatch_enable) {
       // need in-memory processing
-      MOSDOp *m = static_cast<MOSDOp*>(op->get_nonconst_req());
-      ceph_assert(m);
-      if (m->get_data_len() >=  4096) {
-	is_sr_msg = true;
-      } else if (m->get_type() == CEPH_MSG_OSD_OPREPLY || m->get_type() == MSG_OSD_REPOP
-		|| m->get_type() == MSG_OSD_REPOPREPLY) {
+      //MOSDOp *op_m = static_cast<MOSDOp*>(op->get_nonconst_req());
+      //ceph_assert(op_m);
+      if (m->get_data_len() >=  4096 ||
+	  m->get_type() == CEPH_MSG_OSD_OPREPLY || 
+	  m->get_type() == MSG_OSD_REPOP || 
+	  m->get_type() == MSG_OSD_REPOPREPLY) {
 	is_sr_msg = true;
       }
-      // ToDo: flush
-      // disable flush
-#if 0
-      m->finish_decode();
-      do_sd_entry_flush(op);
-#endif
-    }
-    dout(0) << __func__ << " is_sr_msg is " << is_sr_msg 
-	    << " cur cpu " << sched_getcpu() 
-	    << " message type " << m->get_type() << dendl;
+      if (m->get_type() == CEPH_MSG_OSD_OP) {
+	MOSDOp *op_m = static_cast<MOSDOp*>(op->get_nonconst_req());
+	op_m->finish_decode();
+	hobject_t hoid = op_m->get_hobj().get_head();
+	if (is_sr_request(hoid)) {
+	  is_sr_msg = true;
+	} else {
+	  is_sr_msg = false;
+	}
+	//dout(0) << __func__ << " oid " << hoid << dendl;
+      }
     if (!is_sr_msg) {
     // queue it directly
-    enqueue_op(
-      static_cast<MOSDFastDispatchOp*>(m)->get_spg(),
-      std::move(op),
-      static_cast<MOSDFastDispatchOp*>(m)->get_map_epoch());
+      //dout(0) << __func__ << " is not sr m " << *m << dendl;
+      enqueue_op(
+	static_cast<MOSDFastDispatchOp*>(m)->get_spg(),
+	std::move(op),
+	static_cast<MOSDFastDispatchOp*>(m)->get_map_epoch());
     } else {
       spg_t pgid = static_cast<MOSDFastDispatchOp*>(m)->get_spg();
+      //dout(0) << __func__ << " is sr m " << *m << dendl;
       do_sd_process(pgid, op);
     }
   } else {
@@ -7231,6 +7602,430 @@ void OSD::ms_fast_dispatch(Message *m)
   OID_EVENT_TRACE_WITH_MSG(m, "MS_FAST_DISPATCH_END", false); 
 }
 
+#if 0
+      if (is_sr_msg) {
+	if (m->get_type() == CEPH_MSG_OSD_OP) {
+	  MOSDOp *m = static_cast<MOSDOp*>(op->get_nonconst_req());
+	  m->finish_decode();
+	  MOSDOpReply *reply = new MOSDOpReply(m, 0, get_osdmap_epoch(), 0, true);
+	  reply->set_reply_versions(eversion_t(), version_t());
+	  reply->add_flags(CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK);
+	  // selectie dispath
+	  if (is_sr_msg) {
+	    //osd->send_message_osd_client_direct(reply, m->get_connection());
+	    service.send_message_osd_client(reply, m->get_connection());
+	  } else {
+	    service.send_message_osd_client(reply, m->get_connection());
+	  }
+	  return;
+	} 
+      }
+#endif
+
+#if 0
+      // null test
+      if (is_sr_msg) {
+	if (m->get_type() == CEPH_MSG_OSD_REPOPREPLY) {
+	  m->finish_decode();
+	  MOSDOpReply *reply = new MOSDOpReply(m, 0, get_osdmap_epoch(), 0, true);
+	  reply->set_reply_versions(eversion_t(), version_t());
+	  reply->add_flags(CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK);
+	  // selectie dispath
+	  if (is_sr_msg) {
+	    //osd->send_message_osd_client_direct(reply, m->get_connection());
+	    service.send_message_osd_client(reply, m->get_connection());
+	  } else {
+	    service.send_message_osd_client(reply, m->get_connection());
+	  }
+	} else if (m->get_type() == MSG_OSD_REPOP) {
+
+	} else if (m->get_type() == CEPH_MSG_OSD_OP) {
+
+	}
+      }
+#endif
+    }
+#if 0
+    dout(0) << __func__ << " is_sr_msg is " << is_sr_msg 
+	    << " cur cpu " << sched_getcpu() 
+	    << " message type " << m->get_type() << dendl;
+#endif
+#if 0
+    if (cct->_conf->sd_q_policy == SD_ENABLE_FLUSH_Q) {
+      spg_t pgid = static_cast<MOSDFastDispatchOp*>(m)->get_spg();
+      do_sd_process(pgid, op);
+    } else if (!is_sr_msg) {
+#endif
+
+bool OSD::null_test(spg_t pgid, OpRequestRef op, PrimaryLogPG *plpg, PGRef pg, Message *m)
+{
+  bool direct_send = false;
+  if (m->get_type() == CEPH_MSG_OSD_OP && m->get_data_len() >= 4096) {
+    bool target = false;
+
+    MOSDOp *op_m = static_cast<MOSDOp*>(op->get_nonconst_req());
+    op_m->finish_decode();
+    hobject_t hoid = op_m->get_hobj().get_head();
+    if (!is_sr_request(hoid)) {
+      return false;
+    }
+
+    if (cct->_conf->front_ack_backend_do_nothing) {
+      op->sr_type = FRONT_ACK_BACKEND_DO_NOTHING;
+    }
+
+     for (const auto& shard : plpg->get_acting_recovery_backfill_shards()) {
+	 if (shard == plpg->whoami_shard()) continue;
+	 const pg_info_t &pinfo = plpg->get_shard_info().find(shard)->second;
+
+
+	int acks_wanted = CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK;
+	if (cct->_conf->front_ack_backend_do_nothing) {
+	  acks_wanted |= CEPH_OSD_FLAG_NULL_TEST_BACKEND_DO_NOTHING;
+	}
+	acks_wanted |= CEPH_OSD_FLAG_NULL_TEST;
+	eversion_t at_version(
+	      get_osdmap_epoch(),
+		    pg->projected_last_update.version+1);
+
+	target = true;
+	//dout(0) << __func__ << " hoid is " << hoid << dendl;
+
+	// forward the write/update/whatever
+	MOSDRepOp *wr = new MOSDRepOp(
+	  op->get_reqid(), plpg->whoami_shard(),
+	  spg_t(plpg->get_info().pgid.pgid, shard.shard),
+	  hoid, acks_wanted,
+	  get_osdmap_epoch(),
+	  plpg->get_last_peering_reset_epoch(),
+	  0, at_version);
+	  // check tid, at_version !
+
+	// mark final_need as false to recognize that a message is selective patch
+
+	encode(m->get_data(), wr->get_data());
+#if 0
+	dout(0) << __func__ << " op len " << wr->get_data_len() 
+		<< " req id " << op->get_reqid() << dendl;
+#endif
+	wr->logbl = NULL;
+
+	if (pinfo.is_incomplete())
+	  wr->pg_stats = pinfo.stats;  // reflects backfill progress
+	else
+	  wr->pg_stats = plpg->get_info().stats;
+
+	wr->pg_trim_to = plpg->recovery_state.get_pg_trim_to();
+	wr->pg_roll_forward_to = at_version;
+	wr->new_temp_oid = hobject_t();
+	wr->discard_temp_oid = hobject_t();
+
+/*
+	if (op->op && op->op->pg_trace)
+	  wr->trace.init("replicated op", nullptr, &op->op->pg_trace);
+*/
+	Message* wr_mes = wr;
+	// need check!!
+	plpg->send_message_osd_cluster(
+	    shard.osd, wr_mes, get_osdmap_epoch());
+
+	// leak ???
+
+     }
+    int index = op->get_reqid().tid % (cct->_conf->osd_threads_sd << 1);
+    if (target) {
+      if (cache_ops.size() > 0) {
+	//dout(0) << __func__ << " index " << index << " cache size " << cache_ops.size() << dendl;
+	service.sd_cache_ops_locks[index]->lock();
+	cache_ops[index].insert( make_pair(op->get_reqid(), op) );
+	service.sd_cache_ops_locks[index]->unlock();
+      }
+      //cache_ops[op->get_reqid()] = op;
+      pg->unlock();
+      return true;
+    } else {
+      dout(0) << __func__ << " isn't target ?? " << *m << dendl;
+    }
+
+  } else if (m->get_type() == MSG_OSD_REPOP && m->get_data_len() >= 4096) {
+    //dout(0) << __func__ << " receive REPOP ! " << dendl;
+
+    static_cast<MOSDRepOp*>(op->get_nonconst_req())->finish_decode();
+    const MOSDRepOp *m = static_cast<const MOSDRepOp *>(op->get_req());
+    ceph_assert(m->get_type() == MSG_OSD_REPOP);
+
+    if (!(m->acks_wanted & CEPH_OSD_FLAG_NULL_TEST)) {
+      dout(0) << __func__ << " this likely is the target of null test, but no null test flag " << dendl;
+      dout(0) << __func__ << " this likely is the target of null test, but no null test flag " << dendl;
+      return false;
+    }
+
+    if (m->acks_wanted & CEPH_OSD_FLAG_NULL_TEST_BACKEND_DO_NOTHING) {
+      op->sr_type = FRONT_ACK_BACKEND_DO_NOTHING;
+    }
+
+    //get_parent()->update_last_complete_ondisk(rm->last_complete);
+
+    MOSDRepOpReply *reply = new MOSDRepOpReply(
+	m,
+	plpg->whoami_shard(),
+	0, get_osdmap_epoch(), m->get_min_epoch(), CEPH_OSD_FLAG_ONDISK | CEPH_OSD_FLAG_NULL_TEST);
+    reply->set_last_complete_ondisk(eversion_t());
+    reply->set_priority(CEPH_MSG_PRIO_HIGH); // this better match ack priority!
+    //reply->trace = rm->op->pg_trace;
+    // selective dispatch
+    if (direct_send) {
+      plpg->send_message_osd_cluster_direct(
+	  m->get_source().num(), reply, get_osdmap_epoch());
+    } else {
+      plpg->send_message_osd_cluster(
+	  m->get_source().num(), reply, get_osdmap_epoch());
+    }
+    pg->unlock();
+    return true;
+
+  } else if (m->get_type() == MSG_OSD_REPOPREPLY) {
+    // search target...
+    osd_reqid_t req_id = op->get_reqid();
+    int index = op->get_reqid().tid % (cct->_conf->osd_threads_sd << 1);
+    service.sd_cache_ops_locks[index]->lock();
+    ceph_assert(cache_ops.size());
+    auto entry = cache_ops[index].find(req_id);
+    if (entry != cache_ops[index].end()) {
+      OpRequestRef cached_op = entry->second;
+      //dout(0) << __func__ << " found receive REPOP_Reply ! reqid " 
+      //	<< cached_op->get_reqid() << dendl;
+      MOSDOp *m = static_cast<MOSDOp*>(cached_op->get_nonconst_req());
+      
+      //m->finish_decode();
+      MOSDOpReply *reply = new MOSDOpReply(m, 0, get_osdmap_epoch(), 0, true);
+      reply->set_reply_versions(eversion_t(), version_t());
+      reply->add_flags(CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK);
+      // selectie dispath
+      if (direct_send) {
+	//osd->send_message_osd_client_direct(reply, m->get_connection());
+	service.send_message_osd_client_direct(reply, m->get_connection());
+      } else {
+	service.send_message_osd_client(reply, m->get_connection());
+      }
+      cache_ops[op->get_reqid().tid % (service.num_threads_sd << 1)].erase(req_id);
+      service.sd_cache_ops_locks[index]->unlock();
+      pg->unlock();
+      return true;
+    }
+    service.sd_locks[index]->unlock();
+  }
+
+  return false;
+}
+
+bool OSD::fast_rep(spg_t pgid, OpRequestRef op, PrimaryLogPG *plpg, PGRef pg, Message *m, 
+		    ObjectStore::Transaction *op_t, bool & done)
+{
+  bool direct_send = false;
+  if (!op) {
+    return false;
+  }
+  if (m->get_type() == CEPH_MSG_OSD_OP) {
+    bool target = false;
+
+    MOSDOp *op_m = static_cast<MOSDOp*>(op->get_nonconst_req());
+    if (op_m->is_retry_attempt()) {
+      dout(0) << __func__ << " warning !!! retry " << dendl;
+      dout(0) << __func__ << " warning !!! retry " << dendl;
+      dout(0) << __func__ << " warning !!! retry " << dendl;
+      dout(0) << __func__ << " warning !!! retry " << dendl;
+    }
+    op_m->finish_decode();
+    hobject_t hoid = op_m->get_hobj().get_head();
+#if 0
+    if (!is_sr_request(hoid)) {
+      return false;
+    }
+#endif
+    if (cct->_conf->front_ack_backend_do_flush) {
+      op->sr_type = FRONT_ACK_BACKEND_DO_FLUSH;
+    }
+
+    // set op flags
+    init_op_flags(op);
+    if (op->may_read()) {
+      pg->unlock();
+      return true;
+    }
+    
+    int r = plpg->fast_fast_do_osd_ops(hoid, op_m->ops, op_t, op);
+    // Deletion case
+    if (!op_t && r == 0) {
+      MOSDOpReply *reply = new MOSDOpReply(op_m, 0, get_osdmap_epoch(), 0, true);
+      reply->set_reply_versions(eversion_t(), version_t());
+      reply->add_flags(CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK);
+      // selectie dispath
+      if (direct_send) {
+	service.send_message_osd_client_direct(reply, m->get_connection());
+      } else {
+	service.send_message_osd_client(reply, m->get_connection());
+      }
+      done = true;
+      pg->unlock();
+      return true;
+    }
+
+    for (const auto& shard : plpg->get_acting_recovery_backfill_shards()) {
+       if (shard == plpg->whoami_shard()) continue;
+       const pg_info_t &pinfo = plpg->get_shard_info().find(shard)->second;
+
+      __u8 acks_wanted = CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK | CEPH_OSD_FLAG_NULL_TEST;
+      if (cct->_conf->front_ack_backend_do_flush) {
+	acks_wanted |= CEPH_OSD_FLAG_NULL_TEST_BACKEND_DO_FLUSH;
+      }
+      eversion_t at_version(
+	    get_osdmap_epoch(),
+		  pg->projected_last_update.version+1);
+
+      target = true;
+      //dout(0) << __func__ << " hoid is " << hoid << dendl;
+
+      // forward the write/update/whatever
+      MOSDRepOp *wr = new MOSDRepOp(
+	op->get_reqid(), plpg->whoami_shard(),
+	spg_t(plpg->get_info().pgid.pgid, shard.shard),
+	hoid, acks_wanted,
+	get_osdmap_epoch(),
+	plpg->get_last_peering_reset_epoch(),
+	0, at_version);
+	// check tid, at_version !
+
+
+      // dout(0) << __func__ << " op_t size " << op_t->get_num_ops() << dendl;
+      // mark final_need as false to recognize that a message is selective patch
+
+      encode(*op_t, wr->get_data());
+      //encode(m->get_data(), wr->get_data());
+
+#if 0
+      dout(0) << __func__ << " op len " << wr->get_data_len() 
+	      << " req id " << op->get_reqid() << dendl;
+#endif
+
+      wr->logbl = NULL;
+
+      if (pinfo.is_incomplete())
+	wr->pg_stats = pinfo.stats;  // reflects backfill progress
+      else
+	wr->pg_stats = plpg->get_info().stats;
+
+      //wr->pg_trim_to = plpg->recovery_state.get_pg_trim_to();
+      wr->pg_roll_forward_to = at_version;
+      wr->new_temp_oid = hobject_t();
+      wr->discard_temp_oid = hobject_t();
+
+    /*
+      if (op->op && op->op->pg_trace)
+	wr->trace.init("replicated op", nullptr, &op->op->pg_trace);
+    */
+      Message* wr_mes = wr;
+      // need check!!
+      plpg->send_message_osd_cluster(
+	  shard.osd, wr_mes, get_osdmap_epoch());
+
+      // leak ???
+
+    }
+    int index = op->get_reqid().tid % (cct->_conf->osd_threads_sd << 1);
+    if (target) {
+      if (cache_ops.size() > 0) {
+	//dout(0) << __func__ << " index " << index << " cache size " 
+	//	  << cache_ops.size() << dendl;
+	service.sd_cache_ops_locks[index]->lock();
+	cache_ops[index].insert( make_pair(op->get_reqid(), op) );
+	service.sd_cache_ops_locks[index]->unlock();
+      }
+      pg->unlock();
+      return true;
+    } else {
+      dout(0) << __func__ << " isn't target ?? " << *m << dendl;
+    }
+
+  } else if (m->get_type() == MSG_OSD_REPOP) {
+    static_cast<MOSDRepOp*>(op->get_nonconst_req())->finish_decode();
+    const MOSDRepOp *m = static_cast<const MOSDRepOp *>(op->get_req());
+    ceph_assert(m->get_type() == MSG_OSD_REPOP);
+
+    if (!(m->acks_wanted & CEPH_OSD_FLAG_NULL_TEST)) {
+      dout(0) << __func__ << " this likely is the target of null test, but no null test flag " << dendl;
+      dout(0) << __func__ << " this likely is the target of null test, but no null test flag " << " reqid " << op->get_reqid() << dendl;
+      return false;
+    }
+    
+#if 0
+    dout(0) << __func__ << " rep op len " << m->get_data_len() 
+	    << " req id " << op->get_reqid() << " ackwant " << m->acks_wanted << dendl;
+#endif
+    dout(0) << __func__ << " rep op len " << m->get_data_len() 
+	    << " req id " << op->get_reqid() << " ackwant " 
+	    << m->acks_wanted << " m " << *m << dendl;
+
+    if (m->acks_wanted & CEPH_OSD_FLAG_NULL_TEST_BACKEND_DO_FLUSH) {
+      op->sr_type = FRONT_ACK_BACKEND_DO_FLUSH;
+    }
+
+    //get_parent()->update_last_complete_ondisk(rm->last_complete);
+
+    MOSDRepOpReply *reply = new MOSDRepOpReply(
+	m,
+	plpg->whoami_shard(),
+	0, get_osdmap_epoch(), m->get_min_epoch(), 
+	CEPH_OSD_FLAG_ONDISK | CEPH_OSD_FLAG_NULL_TEST);
+
+    reply->set_last_complete_ondisk(eversion_t());
+    reply->set_priority(CEPH_MSG_PRIO_HIGH); // this better match ack priority!
+    //reply->trace = rm->op->pg_trace;
+    // selective dispatch
+    if (direct_send) {
+      plpg->send_message_osd_cluster_direct(
+	  m->get_source().num(), reply, get_osdmap_epoch());
+    } else {
+      plpg->send_message_osd_cluster(
+	  m->get_source().num(), reply, get_osdmap_epoch());
+    }
+    pg->unlock();
+    return true;
+
+  } else if (m->get_type() == MSG_OSD_REPOPREPLY) {
+    // search target...
+    osd_reqid_t req_id = op->get_reqid();
+    int index = op->get_reqid().tid % (cct->_conf->osd_threads_sd << 1);
+    service.sd_cache_ops_locks[index]->lock();
+    ceph_assert(cache_ops.size());
+    auto entry = cache_ops[index].find(req_id);
+    if (entry != cache_ops[index].end()) {
+      OpRequestRef cached_op = entry->second;
+      //dout(0) << __func__ << " found receive REPOP_Reply ! reqid "
+      //		 << cached_op->get_reqid() << dendl;
+      MOSDOp *m = static_cast<MOSDOp*>(cached_op->get_nonconst_req());
+      
+      //m->finish_decode();
+      MOSDOpReply *reply = new MOSDOpReply(m, 0, get_osdmap_epoch(), 0, true);
+      reply->set_reply_versions(eversion_t(), version_t());
+      reply->add_flags(CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK);
+      // selectie dispath
+      if (direct_send) {
+	service.send_message_osd_client_direct(reply, m->get_connection());
+      } else {
+	service.send_message_osd_client(reply, m->get_connection());
+      }
+      cache_ops[op->get_reqid().tid % (service.num_threads_sd << 1)].erase(req_id);
+      service.sd_cache_ops_locks[index]->unlock();
+      pg->unlock();
+      return true;
+    }
+    service.sd_cache_ops_locks[index]->unlock();
+  }
+
+  return false;
+}
+
 void OSD::do_sd_process(spg_t pgid, OpRequestRef op) 
 {
   Message *m = op->get_nonconst_req();
@@ -7248,6 +8043,17 @@ void OSD::do_sd_process(spg_t pgid, OpRequestRef op)
       std::move(op),
       static_cast<MOSDFastDispatchOp*>(m)->get_map_epoch());
   } else {
+    if (cct->_conf->sd_q_policy == SD_ENABLE_FLUSH_Q && 
+	!cct->_conf->front_ack_backend_do_nothing &&
+	!cct->_conf->messenger_null_test && 
+	!cct->_conf->front_ack_backend_do_flush &&
+	!cct->_conf->osd_level_batch_flush) {
+      sdata->shard_lock.unlock();
+      dout(0) << __func__ << " q policy flush q early" << *m << dendl;
+      service.enqueue_sd_entry(object_t(), pgid, 0, op, NULL);
+      return;
+    }
+
     OSDShardPGSlot *slot = t->second.get();
     assert(slot);
     PGRef pg = slot->pg;
@@ -7268,13 +8074,65 @@ void OSD::do_sd_process(spg_t pgid, OpRequestRef op)
 				   suicide_interval);
     
     osd->dequeue_op(pg, op, handle);
-#endif
-    dout(0) << __func__ << " handle selective dispatch " << dendl;
+    //dout(0) << __func__ << " handle selective dispatch " << dendl;
     //plpg->do_op(op);
+#endif
+
+    bool null_target = cct->_conf->messenger_null_test;
+    if (cct->_conf->front_ack_backend_do_nothing) {
+      null_target = true;
+    }
+    if (null_target) {
+      if (null_test(pgid, op, plpg, pg, m)) {
+	dout(0) << __func__ << " null target " << *m << dendl;
+	// already unblock pg
+	if (op->sr_type != FRONT_ACK_BACKEND_DO_NOTHING) {
+	  return;
+	} else if (op->sr_type == FRONT_ACK_BACKEND_DO_NOTHING) {
+	  // this is for perf testing
+	  if (m->get_type() != MSG_OSD_REPOPREPLY) {
+	    service.enqueue_sd_entry(object_t(), pgid, 0, op, NULL);
+	  }
+	  return;
+	} 
+	ceph_assert(0 == " no support ! ");
+      }
+      //dout(0) << __func__ << " not the target of null test " << *m << dendl;
+    } else if (cct->_conf->front_ack_backend_do_flush) {
+      ObjectStore::Transaction *op_t = NULL;
+      bool done = false;
+      if (m->get_type() == CEPH_MSG_OSD_OP) {
+	if (op && m->get_data_len() > 0) {
+	  // this probably is a write op 
+	  op_t = new ObjectStore::Transaction;
+	}
+      }
+      if (fast_rep(pgid, op, plpg, pg, m, op_t, done)) {
+	if (m->get_type() != MSG_OSD_REPOPREPLY) {
+	  if (!op_t && done) {
+	    // delete case
+	    dout(0) << __func__ << " check this op " << *m << dendl;
+	    return;
+	  }
+	  service.enqueue_sd_entry(object_t(), pgid, 0, op, op_t, plpg);
+	}
+	return;
+      } else {
+	if (op_t) {
+	  delete op_t;
+	}
+      }
+    }
+
     heartbeat_handle_d hhd("test");
     time_t timeout_interval, suicide_interval;
     ThreadPool::TPHandle tp_handle(cct, &hhd, fake_timeout_interval,
 				   fake_suicide_interval);
+    utime_t now = ceph_clock_now();
+    op->set_dequeued_time(now);
+    utime_t latency = now - m->get_recv_stamp();
+    logger->tinc(l_osd_op_before_dequeue_op_lat, latency);
+    logger->tinc(l_osd_op_before_queue_op_lat, latency);
     plpg->do_request(op, tp_handle);
     pg->unlock();
   }

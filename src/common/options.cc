@@ -1095,7 +1095,7 @@ std::vector<Option> get_global_options() {
     .set_description("Log level at which to hexdump corrupt messages we receive"),
 
     Option("ms_async_op_threads", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
-    .set_default(3)
+    .set_default(4)
     .set_min_max(1, 24)
     .set_description("Threadpool size for AsyncMessenger (ms_type=async)"),
 
@@ -3852,6 +3852,62 @@ std::vector<Option> get_global_options() {
     Option("osd_selective_dispatch_enable", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(true)
     .set_description("selective dispatch"),
+    // thinstore
+    Option("thinstore_enable", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_description("enable thinstore"),
+    Option("sd_q_policy", Option::TYPE_INT, Option::LEVEL_ADVANCED)
+    .set_default(2)
+    .set_description("1: msgr all 2: msgr as little as possilbe"),
+    Option("messenger_null_test", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_description("messenger_null_test"),
+    Option("front_ack_backend_do_nothing", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_description("messenger_null_test"),
+    Option("front_ack_backend_do_flush", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_description("messenger_null_test"),
+    Option("osd_level_batch_flush", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_description("messenger_null_test"),
+    Option("sd_use_original_backend", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_description("messenger_null_test"),
+#if 0
+    // path, core
+    Option("osd0_path", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default(
+      "/dev/nvme0n1p2,0"
+    )
+    .set_description(""),
+    Option("osd1_path", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default(
+      "/dev/nvme0n1p1,0"
+    )
+    .set_description(""),
+    Option("osd2_path", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default(
+      "/dev/nvme1n1p1,0"
+    )
+    .set_description(""),
+#endif
+
+
+    // selective dispatch
+    Option("issue_io_first_async_io", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_description("messenger_null_test"),
+    Option("issue_io_first_async_io_batch", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_description("messenger_null_test"),
+    Option("issue_io_first_null_test", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_description("messenger_null_test"),
+    Option("issue_io_first_direct_io", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_description("messenger_null_test"),
+
 
     Option("threadpool_default_timeout", Option::TYPE_INT, Option::LEVEL_ADVANCED)
     .set_default(60)

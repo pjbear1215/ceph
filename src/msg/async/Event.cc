@@ -252,9 +252,88 @@ int EventCenter::create_file_event(int fd, int mask, EventCallbackRef ctxt)
   return 0;
 }
 
+int EventCenter::create_file_event_direct(int fd, int mask, EventCallbackRef ctxt)
+{
+  //ceph_assert(in_thread());
+  int r = 0;
+  if (fd >= nevent) {
+    int new_size = nevent << 2;
+    while (fd >= new_size)
+      new_size <<= 2;
+    ldout(cct, 20) << __func__ << " event count exceed " << nevent << ", expand to " << new_size << dendl;
+    r = driver->resize_events(new_size);
+    if (r < 0) {
+      lderr(cct) << __func__ << " event count is exceed." << dendl;
+      return -ERANGE;
+    }
+    file_events.resize(new_size);
+    nevent = new_size;
+  }
+
+  EventCenter::FileEvent *event = _get_file_event(fd);
+  ldout(cct, 20) << __func__ << " create event started fd=" << fd << " mask=" << mask
+                 << " original mask is " << event->mask << dendl;
+  if (event->mask == mask)
+    return 0;
+
+  r = driver->add_event(fd, event->mask, mask);
+  if (r < 0) {
+    // Actually we don't allow any failed error code, caller doesn't prepare to
+    // handle error status. So now we need to assert failure here. In practice,
+    // add_event shouldn't report error, otherwise it must be a innermost bug!
+    lderr(cct) << __func__ << " add event failed, ret=" << r << " fd=" << fd
+               << " mask=" << mask << " original mask is " << event->mask << dendl;
+    ceph_abort_msg("BUG!");
+    return r;
+  }
+
+  event->mask |= mask;
+  if (mask & EVENT_READABLE) {
+    event->read_cb = ctxt;
+  }
+  if (mask & EVENT_WRITABLE) {
+    event->write_cb = ctxt;
+  }
+  ldout(cct, 20) << __func__ << " create event end fd=" << fd << " mask=" << mask
+                 << " original mask is " << event->mask << dendl;
+  return 0;
+}
+
 void EventCenter::delete_file_event(int fd, int mask)
 {
   ceph_assert(in_thread() && fd >= 0);
+  if (fd >= nevent) {
+    ldout(cct, 1) << __func__ << " delete event fd=" << fd << " is equal or greater than nevent=" << nevent
+                  << "mask=" << mask << dendl;
+    return ;
+  }
+  EventCenter::FileEvent *event = _get_file_event(fd);
+  ldout(cct, 30) << __func__ << " delete event started fd=" << fd << " mask=" << mask
+                 << " original mask is " << event->mask << dendl;
+  if (!event->mask)
+    return ;
+
+  int r = driver->del_event(fd, event->mask, mask);
+  if (r < 0) {
+    // see create_file_event
+    ceph_abort_msg("BUG!");
+  }
+
+  if (mask & EVENT_READABLE && event->read_cb) {
+    event->read_cb = nullptr;
+  }
+  if (mask & EVENT_WRITABLE && event->write_cb) {
+    event->write_cb = nullptr;
+  }
+
+  event->mask = event->mask & (~mask);
+  ldout(cct, 30) << __func__ << " delete event end fd=" << fd << " mask=" << mask
+                 << " original mask is " << event->mask << dendl;
+}
+
+void EventCenter::delete_file_event_direct(int fd, int mask)
+{
+  ceph_assert(fd >= 0);
   if (fd >= nevent) {
     ldout(cct, 1) << __func__ << " delete event fd=" << fd << " is equal or greater than nevent=" << nevent
                   << "mask=" << mask << dendl;

@@ -2148,6 +2148,12 @@ int ECBackend::objects_read_sync(
   uint32_t op_flags,
   bufferlist *bl)
 {
+  dout(0) << __func__ << " erasure code " << hoid << dendl;
+  if (is_sr_request(hoid) && cct->_conf->thinstore_enable) {
+    ObjectStore * ostore = get_parent()->get_thinstore();
+    assert(ostore);
+    return ostore->read(ch, ghobject_t(hoid), off, len, *bl, op_flags);
+  }
   return -EOPNOTSUPP;
 }
 

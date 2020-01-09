@@ -288,6 +288,8 @@ public:
   ZTracer::Trace store_trace;
   ZTracer::Trace journal_trace;
 
+  // selective dispatch
+  int sd_index;
   virtual ~TrackedOp() {}
 
   void get() {

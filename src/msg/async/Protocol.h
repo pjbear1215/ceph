@@ -135,6 +135,9 @@ public:
   int get_con_mode() const {
     return auth_meta->con_mode;
   }
+
+  // selective dispath
+  virtual void send_message_direct(Message *m) {};
 };
 
 #endif /* _MSG_ASYNC_PROTOCOL_ */

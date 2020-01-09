@@ -21,17 +21,6 @@
 #define PRIMARY_SD_IO 1
 #define SECONDARY_SD_IO 2
 
-class sd_entry {
-public:
-  vector<ObjectStore::Transaction> tls;
-  OpRequestRef op;
-  spg_t pgid;
-  object_t oid;
-  int type;
-  eversion_t at_version;
-  uint64_t sd_seq;
-};
-
 #if 0
 class sd_indicator {
 public:
@@ -202,6 +191,14 @@ public:
     uint64_t len,
     uint32_t op_flags,
     bufferlist *bl) override;
+
+  int objects_read_sync(
+    const hobject_t &hoid,
+    uint64_t off,
+    uint64_t len,
+    uint32_t op_flags,
+    bufferlist *bl,
+    int sd_index) override;
 
   void objects_read_async(
     const hobject_t &hoid,
@@ -423,12 +420,28 @@ public:
     OpRequestRef op
     ) override;
 
+  // selective dispatch
+  void fast_submit_transaction(
+    const hobject_t &soid,
+    //const object_stat_sum_t &delta_stats,
+    const eversion_t &at_version,
+    PGTransactionUPtr &&_t,
+    //const eversion_t &trim_to,
+    //const eversion_t &roll_forward_to,
+    const vector<pg_log_entry_t> &_log_entries,
+    //std::optional<pg_hit_set_history_t> &hset_history,
+    //Context *on_all_commit,
+    //ceph_tid_t tid,
+    osd_reqid_t reqid,
+    OpRequestRef orig_op) override;
+
     // selective dispatch
     queue<sd_entry*> sd_entries;
     void sd_enqueue(sd_entry * entry, object_t oid);
     sd_entry * sd_dequeue();
     uint64_t inc_sd_seq();
     uint64_t get_sd_seq();
+    bool is_sr_request(const hobject_t& obj);
     void do_sd_entry() override;
 
 private:

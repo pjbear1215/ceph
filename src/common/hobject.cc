@@ -595,3 +595,21 @@ int cmp(const ghobject_t& l, const ghobject_t& r)
     return 1;
   return 0;
 }
+
+// selective dispatch
+bool is_sr_request(const hobject_t& obj) {
+  if (obj.oid.name.find("rbd_data") != string::npos) {
+    return true;
+  } else if (obj.oid.name.find("benchmark") != string::npos) {
+    // need a deletion. this is only for debug
+    return true;
+  } else {
+    return false;
+  }
+  if (obj.oid.name.find("rbd_object_map") != string::npos) {
+    return false;
+  } 
+  return true;
+}
+
+

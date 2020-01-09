@@ -544,6 +544,13 @@ enum {
 	CEPH_OSD_BACKOFF_OP_UNBLOCK = 3,
 };
 
+//selective dispatch
+enum {
+	CEPH_OSD_FLAG_NULL_TEST = 0x0008,
+	CEPH_OSD_FLAG_NULL_TEST_BACKEND_DO_NOTHING = 0x0010,
+	CEPH_OSD_FLAG_NULL_TEST_BACKEND_DO_FLUSH = 0x0020,
+};
+
 const char *ceph_osd_backoff_op_name(int op);
 
 /*

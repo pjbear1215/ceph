@@ -351,6 +351,46 @@ ssize_t AsyncConnection::_try_send(bool more)
   return outcoming_bl.length();
 }
 
+ssize_t AsyncConnection::_try_send_direct(bool more)
+{
+  if (async_msgr->cct->_conf->ms_inject_socket_failures && cs) {
+    if (rand() % async_msgr->cct->_conf->ms_inject_socket_failures == 0) {
+      ldout(async_msgr->cct, 0) << __func__ << " injecting socket failure" << dendl;
+      cs.shutdown();
+    }
+  }
+
+  //ceph_assert(center->in_thread());
+  ldout(async_msgr->cct, 25) << __func__ << " cs.send " << outcoming_bl.length()
+                             << " bytes" << dendl;
+  ssize_t r = cs.send(outcoming_bl, more);
+  if (r < 0) {
+    ldout(async_msgr->cct, 1) << __func__ << " send error: " << cpp_strerror(r) << dendl;
+    return r;
+  }
+
+  ldout(async_msgr->cct, 10) << __func__ << " sent bytes " << r
+                             << " remaining bytes " << outcoming_bl.length() << dendl;
+
+  if (!open_write && is_queued()) {
+    ldout(async_msgr->cct, 0) << __func__ << " open write is true " << dendl;
+    center->create_file_event(cs.fd(), EVENT_WRITABLE, write_handler);
+    open_write = true;
+  }
+
+  if (open_write && !is_queued()) {
+    ldout(async_msgr->cct, 0) << __func__ << " open write is false " << dendl;
+    //center->delete_file_event(cs.fd(), EVENT_WRITABLE);
+    center->delete_file_event_direct(cs.fd(), EVENT_WRITABLE);
+    open_write = false;
+    if (writeCallback) {
+      center->dispatch_event_external(write_callback_handler);
+    }
+  }
+
+  return outcoming_bl.length();
+}
+
 void AsyncConnection::inject_delay() {
   if (async_msgr->cct->_conf->ms_inject_internal_delays) {
     ldout(async_msgr->cct, 10) << __func__ << " sleep for " <<
@@ -568,6 +608,63 @@ int AsyncConnection::send_message(Message *m)
   logger->inc(l_msgr_send_messages);
 
   protocol->send_message(m);
+  return 0;
+}
+
+int AsyncConnection::send_message_direct(Message *m)
+{
+  FUNCTRACE(async_msgr->cct);
+  lgeneric_subdout(async_msgr->cct, ms,
+		   1) << "-- " << async_msgr->get_myaddrs() << " --> "
+		      << get_peer_addrs() << " -- "
+		      << *m << " -- " << m << " con "
+		      << this
+		      << dendl;
+
+  auto cct = async_msgr->cct;
+  if ((cct->_conf->ms_blackhole_mon && peer_type == CEPH_ENTITY_TYPE_MON)||
+      (cct->_conf->ms_blackhole_osd && peer_type == CEPH_ENTITY_TYPE_OSD)||
+      (cct->_conf->ms_blackhole_mds && peer_type == CEPH_ENTITY_TYPE_MDS)||
+      (cct->_conf->ms_blackhole_client &&
+       peer_type == CEPH_ENTITY_TYPE_CLIENT)) {
+    lgeneric_subdout(cct, ms, 0) << __func__ << ceph_entity_type_name(peer_type)
+				 << " blackhole " << *m << dendl;
+    m->put();
+    return 0;
+  }
+
+  // optimistic think it's ok to encode(actually may broken now)
+  if (!m->get_priority())
+    m->set_priority(async_msgr->get_default_send_priority());
+
+  m->get_header().src = async_msgr->get_myname();
+  m->set_connection(this);
+
+#if defined(WITH_LTTNG) && defined(WITH_EVENTTRACE)
+  if (m->get_type() == CEPH_MSG_OSD_OP)
+    OID_EVENT_TRACE_WITH_MSG(m, "SEND_MSG_OSD_OP_BEGIN", true);
+  else if (m->get_type() == CEPH_MSG_OSD_OPREPLY)
+    OID_EVENT_TRACE_WITH_MSG(m, "SEND_MSG_OSD_OPREPLY_BEGIN", true);
+#endif
+
+  if (is_loopback) { //loopback connection
+    ldout(async_msgr->cct, 20) << __func__ << " " << *m << " local" << dendl;
+    std::lock_guard<std::mutex> l(write_lock);
+    if (protocol->is_connected()) {
+      dispatch_queue->local_delivery(m, m->get_priority());
+    } else {
+      ldout(async_msgr->cct, 10) << __func__ << " loopback connection closed."
+                                 << " Drop message " << m << dendl;
+      m->put();
+    }
+    return 0;
+  }
+
+  // we don't want to consider local message here, it's too lightweight which
+  // may disturb users
+  logger->inc(l_msgr_send_messages);
+
+  protocol->send_message_direct(m);
   return 0;
 }
 

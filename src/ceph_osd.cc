@@ -318,7 +318,6 @@ int main(int argc, const char **argv)
     forker.exit(-ENODEV);
   }
 
-
   if (mkkey) {
     common_init_finish(g_ceph_context);
     KeyRing keyring;
@@ -719,6 +718,20 @@ flushjournal_out:
   register_async_signal_handler_oneshot(SIGTERM, handle_osd_signal);
 
   osd->final_init();
+
+  // thinstore
+  bool thinstore_enable = g_conf().get_val<bool>("thinstore_enable");
+  if (thinstore_enable) {
+    ObjectStore *thin_store = ObjectStore::create(g_ceph_context,
+					     "thinstore",
+					     data_path,
+					     journal_path,
+					     flags);
+
+    thin_store->set_orig_store(store, whoami);
+    osd->thinstore = thin_store;
+    thin_store->mount();
+  }
 
   if (g_conf().get_val<bool>("inject_early_sigterm"))
     kill(getpid(), SIGTERM);

@@ -27,6 +27,10 @@ Messenger *Messenger::create(CephContext *cct, const string &type,
     r = 0;
     //r = ceph::util::generate_random_number(0, 1);
   }
+
+  //selective dispatch
+  lderr(cct) << "omw messenger create name  '" << name << "'" << dendl;
+
   if (r == 0 || type.find("async") != std::string::npos)
     return new AsyncMessenger(cct, name, type, std::move(lname), nonce);
   lderr(cct) << "unrecognized ms_type '" << type << "'" << dendl;

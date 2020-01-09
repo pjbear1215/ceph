@@ -32,6 +32,12 @@ if(WITH_BLUESTORE)
     bluestore/FreelistManager.cc
     bluestore/StupidAllocator.cc
     bluestore/BitmapAllocator.cc
+    thinstore/aio.cc
+    thinstore/ThBlockDevice.cc
+    thinstore/thinstore.cc
+    thinstore/ThKernelDevice.cc
+    thinstore/allocator.cc
+    thinstore/thinstore_types.cc
   )
 endif(WITH_BLUESTORE)
 

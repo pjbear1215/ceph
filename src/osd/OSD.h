@@ -66,9 +66,19 @@
 
 // selective distpatch
 #define ENABLE_SELECTIVE_DISPATCH 1
-#define SD_ENTRY_FLUSH_THRESHOLD 10
-#define SD_ENTRY_KEEP_IN_MEMORY 10
-#define SD_PG_SEND_SIGNAL 5
+//#define SD_ENTRY_FLUSH_THRESHOLD 10
+#define SD_ENTRY_FLUSH_THRESHOLD 1
+//#define SD_ENTRY_KEEP_IN_MEMORY 100
+//#define SD_ENTRY_KEEP_IN_MEMORY 31
+#define SD_ENTRY_KEEP_IN_MEMORY 15
+//#define SD_ENTRY_KEEP_IN_MEMORY 0
+#define SD_PG_SEND_SIGNAL 32
+#define FRONT_ACK_BACKEND_DO_NOTHING 2
+#define FRONT_ACK_BACKEND_DO_FLUSH 3
+
+// q policy
+#define SD_ENABLE_FLUSH_Q 2
+
 class sd_indicator {
   public:
     map< object_t, queue<uint64_t> > indicator;
@@ -151,6 +161,18 @@ class MOSDForceRecovery;
 class MMonGetPurgedSnapsReply;
 
 class OSD;
+
+// selective dispatch
+struct sd_queue_entry {
+  object_t oid;
+  spg_t pgid;
+  uint64_t sd_seq;
+  uint64_t flag;
+  // v2
+  OpRequestRef op;
+  ObjectStore::Transaction *op_t;
+  bool processed = false;
+};
 
 class OSDService {
 public:
@@ -304,6 +326,8 @@ public:
   ConnectionRef get_con_osd_cluster(int peer, epoch_t from_epoch);
   pair<ConnectionRef,ConnectionRef> get_con_osd_hb(int peer, epoch_t from_epoch);  // (back, front)
   void send_message_osd_cluster(int peer, Message *m, epoch_t from_epoch);
+  // selective dispatch
+  void send_message_osd_cluster_direct(int peer, Message *m, epoch_t from_epoch);
   void send_message_osd_cluster(Message *m, Connection *con) {
     con->send_message(m);
   }
@@ -313,13 +337,24 @@ public:
   void send_message_osd_client(Message *m, Connection *con) {
     con->send_message(m);
   }
+  // selective dispatch
+  void send_message_osd_client_direct(Message *m, Connection *con) {
+    con->send_message_direct(m);
+  }
+  // selective dispatch
+  void send_message_osd_client_direct(Message *m, const ConnectionRef& con) {
+    con->send_message_direct(m);
+  }
   void send_message_osd_client(Message *m, const ConnectionRef& con) {
     con->send_message(m);
   }
   entity_name_t get_cluster_msgr_name() const;
   // selective dispatch
-  void enqueue_sd_entry(object_t oid, spg_t pgid, uint64_t seq);
+  void enqueue_sd_entry(object_t oid, spg_t pgid, uint64_t seq, OpRequestRef op = NULL, 
+			ObjectStore::Transaction * op_t = NULL, PrimaryLogPG * plpg = NULL);
   void sd_entry_flush(int index, bool need_flush, Mutex& sd_lock_local);
+  void sd_merge_entry(vector<struct sd_queue_entry> * list, int sd_index, PrimaryLogPG* plpg);
+  void sd_merge_entry_flush(int index, bool need_flush, Mutex& sd_lock_local);
   void send_signal_to_sd_queue(spg_t pgid) {
     int sd_index = pgid.ps() % num_threads_sd;
     assert(sd_conds[sd_index]);
@@ -332,22 +367,54 @@ public:
     sd_conds[sd_index]->Signal();
     sd_locks[sd_index]->Unlock();
   }
-  uint64_t inc_sd_seq(spg_t pgid) {
+  void send_signal_to_sd_queue_wo_lock(spg_t pgid, int index = -1) {
     int sd_index = pgid.ps() % num_threads_sd;
+    if (index != -1) {
+      // need check !!!!
+      // need check !!!!!!!!!!!!!!!!
+      // need check !!!!!!!!!!!!!!!!
+      // need check !!!!!!!!!!!!!!!!
+      // need check !!!!!!!!!!!!!!!!
+      // need check !!!!!!!!!!!!!!!!
+      // need check !!!!!!!!!!!!!!!!
+      // need check !!!!!!!!!!!!!!!!
+      sd_index = index;
+      //sd_index += 2;
+    }
+    assert(sd_index < num_threads_sd);
+    assert(sd_conds[sd_index]);
     if (cct->_conf->osd_affinity_enable) {
       int cpu = sched_getcpu();
-      sd_index = cpu % num_threads_sd;
+      if (index == -1) {
+	sd_index = cpu % num_threads_sd;
+      }
+    }
+    assert(sd_index < num_threads_sd);
+    sd_conds[sd_index]->Signal();
+  }
+  uint64_t inc_sd_seq(spg_t pgid, int sd_index = -1) {
+    if (sd_index == -1) {
+      int index = pgid.ps() % num_threads_sd;
+      if (cct->_conf->osd_affinity_enable) {
+	int cpu = sched_getcpu();
+	index = cpu % num_threads_sd;
+      }
+      return sd_seqs[index]++;
     }
     return sd_seqs[sd_index]++;
   }
-  uint64_t get_sd_seq(spg_t pgid) {
-    int sd_index = pgid.ps() % num_threads_sd;
-    if (cct->_conf->osd_affinity_enable) {
-      int cpu = sched_getcpu();
-      sd_index = cpu % num_threads_sd;
+  uint64_t get_sd_seq(spg_t pgid, int sd_index = -1) {
+    if (sd_index == -1) {
+      int index = pgid.ps() % num_threads_sd;
+      if (cct->_conf->osd_affinity_enable) {
+	int cpu = sched_getcpu();
+	index = cpu % num_threads_sd;
+      }
+      return sd_seqs[index];
     }
     return sd_seqs[sd_index];
   }
+  ObjectStore * get_thinstore();
 
 private:
   // -- scrub scheduling --
@@ -465,12 +532,7 @@ private:
   // selective dispatch
   // need to remove locks...
 #define NEED_FLUSH 1
-  struct sd_queue_entry {
-    object_t oid;
-    spg_t pgid;
-    uint64_t sd_seq;
-    uint64_t flag;
-  };
+#define SEND_SIGNAL 2
   //vector< queue<pair<object_t, spg_t> > > sd_queue;
   //queue<pair<object_t, spg_t> > sd_queue[NUM_OF_SD_THREAD];
   struct SDThread : public Thread {
@@ -482,7 +544,10 @@ private:
     explicit SDThread(OSDService *o, int index) : osd(o), index(index) {}
     void *entry() override {
       if (enable_affinity) {
+	char tp_name[64];
 	osd->set_sd_affinity(cpu_affinity);
+	sprintf(tp_name, "SD Thread-%u", cpu_affinity);
+	ceph_pthread_setname(pthread_self(), tp_name);
       }
       osd->sd_entry(index);
       return NULL;
@@ -490,7 +555,7 @@ private:
   };
 
 public:
-  vector< queue<struct sd_queue_entry > > sd_queue;
+  vector< std::list<struct sd_queue_entry > > sd_queue;
   vector< struct SDThread * > sd_threads;
   vector< bool > sd_stop_flag;
   vector< Mutex * > sd_locks;
@@ -498,6 +563,8 @@ public:
   vector< int > sd_seqs;
   vector< sd_indicator *> sd_indicators;
   vector <uint64_t> sd_queue_status;
+  int sd_q_policy = 0;
+  vector< Mutex * > sd_cache_ops_locks;
 
   void agent_entry();
   void agent_stop();
@@ -1238,6 +1305,9 @@ public:
   // selective dispatch
   void do_sd_entry_flush(OpRequestRef op);
   void do_sd_process(spg_t pgid, OpRequestRef op);
+  bool null_test(spg_t pgid, OpRequestRef op, PrimaryLogPG *plpg, PGRef pg, Message *m);
+  bool fast_rep(spg_t pgid, OpRequestRef op, PrimaryLogPG *plpg, PGRef pg, Message *m, 
+		    ObjectStore::Transaction *op_t, bool & done);
 
 protected:
 
@@ -1288,6 +1358,7 @@ protected:
   // selective dispatch
   set<OpRequestRef> request_log;
   time_t fake_timeout_interval, fake_suicide_interval;
+  vector< map <osd_reqid_t, OpRequestRef> > cache_ops;
 
 public:
   ClassHandler  *class_handler = nullptr;
@@ -2297,6 +2368,8 @@ public:
 public:
   OSDService service;
   friend class OSDService;
+  // thinstore
+  ObjectStore *thinstore;
 
 private:
   void set_perf_queries(

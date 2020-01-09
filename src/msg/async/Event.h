@@ -199,9 +199,13 @@ class EventCenter {
   EventDriver *get_driver() { return driver; }
 
   // Used by internal thread
+  // selective dispatch
+  int create_file_event_direct(int fd, int mask, EventCallbackRef ctxt);
   int create_file_event(int fd, int mask, EventCallbackRef ctxt);
   uint64_t create_time_event(uint64_t milliseconds, EventCallbackRef ctxt);
   void delete_file_event(int fd, int mask);
+  // selective dispatch
+  void delete_file_event_direct(int fd, int mask);
   void delete_time_event(uint64_t id);
   int process_events(unsigned timeout_microseconds, ceph::timespan *working_dur = nullptr);
   void wakeup();

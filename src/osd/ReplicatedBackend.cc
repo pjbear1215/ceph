@@ -252,6 +252,29 @@ int ReplicatedBackend::objects_read_sync(
   uint32_t op_flags,
   bufferlist *bl)
 {
+  if (is_sr_request(hoid) && cct->_conf->thinstore_enable) {
+    ObjectStore * ostore = get_parent()->get_thinstore();
+    assert(ostore);
+    dout(0) << __func__ << " please use another object_read_sync " << hoid << dendl;
+    return ostore->read(ch, ghobject_t(hoid), off, len, *bl, op_flags);
+  }
+  return store->read(ch, ghobject_t(hoid), off, len, *bl, op_flags);
+}
+
+int ReplicatedBackend::objects_read_sync(
+  const hobject_t &hoid,
+  uint64_t off,
+  uint64_t len,
+  uint32_t op_flags,
+  bufferlist *bl,
+  int sd_index)
+{
+  if (is_sr_request(hoid) && cct->_conf->thinstore_enable) {
+    ObjectStore * ostore = get_parent()->get_thinstore();
+    assert(ostore);
+    dout(0) << __func__ << " correct version " << hoid << dendl;
+    return ostore->read(ch, ghobject_t(hoid), off, len, *bl, op_flags, sd_index);
+  }
   return store->read(ch, ghobject_t(hoid), off, len, *bl, op_flags);
 }
 
@@ -440,6 +463,16 @@ void ReplicatedBackend::submit_transaction(
   osd_reqid_t reqid,
   OpRequestRef orig_op)
 {
+  // selective dispatch for debug
+#if 0
+  if (orig_op && orig_op->sr_type == FRONT_ACK_BACKEND_DO_NOTHING) {
+    orig_op->is_sr_op = true;
+    if (on_all_commit)
+      on_all_commit->complete(0);
+    return;
+  }
+#endif
+
   parent->apply_stats(
     soid,
     delta_stats);
@@ -470,6 +503,8 @@ void ReplicatedBackend::submit_transaction(
   ceph_assert(insert_res.second);
   InProgressOp &op = *insert_res.first->second;
 
+  // selective dispatch for debug
+  if (!op.op || op.op->sr_type != FRONT_ACK_BACKEND_DO_NOTHING) {
   op.waiting_for_commit.insert(
     parent->get_acting_recovery_backfill_shards().begin(),
     parent->get_acting_recovery_backfill_shards().end());
@@ -490,6 +525,9 @@ void ReplicatedBackend::submit_transaction(
 
   add_temp_objs(added);
   clear_temp_objs(removed);
+  } else {
+    op.waiting_for_commit.insert(get_parent()->whoami_shard());
+  }
 
   parent->log_operation(
     log_entries,
@@ -501,11 +539,15 @@ void ReplicatedBackend::submit_transaction(
   
 #ifdef ENABLE_SELECTIVE_DISPATCH
   bool is_sd = false;
-  if (op.op->get_req()->get_data().length() >= 4096 &&
-      cct->_conf->osd_selective_dispatch_enable) {
-    is_sd = true;
-    op.op->is_sr_op = true;
+  if (op.op && op.op->get_req()->get_data().length() >= 4096 &&
+      cct->_conf->osd_selective_dispatch_enable &&
+      is_sr_request(soid)) {
+    if (!cct->_conf->sd_use_original_backend) {
+      is_sd = true;
+      op.op->is_sr_op = true;
+    }
   }
+
 #if 0
   bufferlist test_logs;
   encode(log_entries, test_logs);
@@ -523,25 +565,71 @@ void ReplicatedBackend::submit_transaction(
       new C_OSD_OnOpCommit(this, &op)));
 #endif
 
-  vector<ObjectStore::Transaction> tls;
-  tls.push_back(std::move(op_t));
 #ifdef ENABLE_SELECTIVE_DISPATCH
+  vector<ObjectStore::Transaction> tls;
+  bool has_write_op = true;
   // inc seq
   uint64_t new_sd_seq = inc_sd_seq();
+#if 0
+  {
+    ObjectStore::Transaction::iterator i = op_t.begin();
+    for (int pos = 0; i.have_op(); ++pos) {
+      ObjectStore::Transaction::Op *op = i.decode_op();
+      if (op->op == ObjectStore::Transaction::OP_WRITE) {
+	has_write_op = true;
+      }
+    }
+  }
+#endif
   // queue
-  if (is_sd) {
+  if (is_sd && has_write_op) {
     sd_entry * en = new sd_entry;
-    en->tls = tls;
+    bool direct_io = cct->_conf->issue_io_first_direct_io;
+    bool async_io = cct->_conf->issue_io_first_async_io;
+    bool null_test = cct->_conf->issue_io_first_null_test;
+
+    if (op.op->sr_type == FRONT_ACK_BACKEND_DO_NOTHING) {
+      null_test = true;
+    }
+
+    en->tls.push_back(std::move(op_t));
     en->op = op.op;
+    if (cct->_conf->osd_affinity_enable) {
+      op.op->sd_index = sched_getcpu() % cct->_conf->osd_threads_sd;
+    } else {
+      op.op->sd_index = -1;
+    }
     en->pgid = get_parent()->whoami_spg_t();
     en->type = PRIMARY_SD_IO;
     en->at_version = at_version;
     en->sd_seq = new_sd_seq;
-    sd_enqueue(en, soid.oid);
+    // enable selective dispath
+    // disalbe selective dispath
+    if (async_io) {
+      sd_enqueue(en, soid.oid);
+    } else if (null_test) {
+      null_test = true;
+    } else if (direct_io) {
+      parent->queue_transactions_thin(en->tls, en->op);
+    }
+#if 0
+    for (auto p : en->tls) {
+      dout(0) << __func__ << " " << soid << " " << p.get_num_bytes() << dendl;
+    }
+#endif
     InProgressOpRef op_ref  = &op;
     op_commit(op_ref);
+
+    if (direct_io || null_test) {
+      delete en;
+    }
     return;
+  } else {
+    tls.push_back(std::move(op_t));
   }
+#else 
+  vector<ObjectStore::Transaction> tls;
+  tls.push_back(std::move(op_t));
 #endif
   parent->queue_transactions(tls, op.op);
   if (at_version != eversion_t()) {
@@ -549,26 +637,140 @@ void ReplicatedBackend::submit_transaction(
   }
 }
 
+// selective dispatch
+void ReplicatedBackend::fast_submit_transaction(
+  const hobject_t &soid,
+  //const object_stat_sum_t &delta_stats,
+  const eversion_t &at_version,
+  PGTransactionUPtr &&_t,
+  //const eversion_t &trim_to,
+  //const eversion_t &roll_forward_to,
+  const vector<pg_log_entry_t> &_log_entries,
+  //std::optional<pg_hit_set_history_t> &hset_history,
+  //Context *on_all_commit,
+  //ceph_tid_t tid,
+  osd_reqid_t reqid,
+  OpRequestRef orig_op)
+{
+
+  ObjectStore::Transaction op_t;
+  //PGTransactionUPtr t(std::move(ctx->op_t));
+  PGTransactionUPtr t(std::move(_t));
+  set<hobject_t> added, removed;
+  vector<pg_log_entry_t> log_entries(_log_entries);
+  //vector<pg_log_entry_t> log_entries();
+  generate_transaction(
+    t,
+    coll,
+    log_entries,
+    &op_t,
+    &added,
+    &removed,
+    get_osdmap()->require_osd_release);
+
+  sd_entry * en = new sd_entry;
+  bool null_test = true;
+  uint64_t new_sd_seq = inc_sd_seq();
+
+  en->tls.push_back(std::move(op_t));
+  en->op = orig_op;
+  if (cct->_conf->osd_affinity_enable) {
+    orig_op->sd_index = sched_getcpu() % cct->_conf->osd_threads_sd;
+  } else {
+    orig_op->sd_index = -1;
+  }
+  en->pgid = get_parent()->whoami_spg_t();
+  en->type = PRIMARY_SD_IO;
+  en->at_version = at_version;
+  en->sd_seq = new_sd_seq;
+
+  //queue_transactions_thin(en->tls, en->op);
+
+  if (null_test) {
+    delete en;
+  }
+}
+
+bool ReplicatedBackend::is_sr_request(const hobject_t& obj) {
+  if (obj.oid.name.find("rbd_object_map") != string::npos) {
+    return false;
+  }
+  if (obj.oid.name.find("rbd_data") != string::npos) {
+    return true;
+  } 
+  return false;
+}
+
 //selective dispatch
 void ReplicatedBackend::do_sd_entry() {
   //int flush_size = 50;
   int done_io = 0;
+  bool batching = cct->_conf->issue_io_first_async_io_batch;
   //while (flush_size > 0 && sd_entries.size() > 0) {
   sd_entry * en = sd_dequeue();
-  if (en) {
+  if (en && !batching) {
     assert(en->tls.size());
-    parent->queue_transactions(en->tls, en->op);
+    if (cct->_conf->thinstore_enable) {
+      dout(30) << __func__ << " thin store " << " sd_index " 
+	      << en->op->sd_index << dendl;
+      parent->queue_transactions_thin(en->tls, en->op);
+    } else {
+      ceph_assert(en->op);
+      parent->queue_transactions(en->tls, en->op);
+    }
     if (en->type == PRIMARY_SD_IO) {
       if (en->at_version != eversion_t()) {
 	parent->op_applied(en->at_version);
       }
     }
-    dout(0) << __func__ << " oid " << en->oid << " is done " << dendl;
+    dout(30) << __func__ << " oid " << en->oid << " is done " << dendl;
     delete en;
+    done_io++;
+  } else if (en && batching) {
+    assert(en->tls.size());
+    if (cct->_conf->thinstore_enable) {
+      dout(30) << __func__ << " thin store batching" << " sd_index " 
+	      << en->op->sd_index <<dendl;
+      // batching
+      int batch_count = 32;
+      //vector< pair<OpRequestRef op, vector<ObjectStore::Transaction>> > ops_list;
+      vector< sd_entry *> ops_list;
+      while (batch_count > 0 && en) {
+	//ops_list.push_back( make_pair(en->op, en->tls) );
+	ops_list.push_back(en);
+	batch_count--;
+	en = sd_dequeue();
+      }
+      parent->queue_transactions_thin_batch(ops_list, ops_list[0]->op);
+      for (auto p : ops_list) {
+	if (p->type == PRIMARY_SD_IO) {
+	  if (p->at_version != eversion_t()) {
+	    parent->op_applied(p->at_version);
+	  }
+	}
+	dout(30) << __func__ << " oid " << p->oid << " is done " << dendl;
+      }
+      done_io += ops_list.size();
+      for (int i = 0; i < ops_list.size(); i++) {
+	delete ops_list[i];
+      }
+    } else {
+      while (en) {
+	ceph_assert(en->op);
+	parent->queue_transactions(en->tls, en->op);
+	if (en->type == PRIMARY_SD_IO) {
+	  if (en->at_version != eversion_t()) {
+	    parent->op_applied(en->at_version);
+	  }
+	}
+	dout(30) << __func__ << " oid " << en->oid << " is done " << dendl;
+	delete en;
+	en = sd_dequeue();
+      }
+    }
   }
-  done_io++;
   //}
-  dout(0) << __func__ << " pg " << get_parent()->whoami_spg_t() 
+  dout(30) << __func__ << " pg " << get_parent()->whoami_spg_t() 
 	  << " done io : " << done_io << dendl;
 }
 
@@ -577,12 +779,12 @@ void ReplicatedBackend::sd_enqueue(sd_entry * entry, object_t oid) {
   get_parent()->enqueue_sd_entry(oid, entry->pgid, entry->sd_seq);
   sd_entries.push(entry);
   entry->oid = oid;
-  dout(0) << __func__ << " oid " << oid << " entry length " << sd_entries.size()
+  dout(30) << __func__ << " oid " << oid << " entry length " << sd_entries.size()
 	  << " type " << entry->type << " local cpu " << sched_getcpu() 
 	  << " op length " << entry->op->get_req()->get_data().length() << dendl;
   if (sd_entries.size() >= SD_PG_SEND_SIGNAL) {
     get_parent()->send_signal_to_sd_queue(entry->pgid);
-    dout(0) << __func__ << " seind signal to wake up sd queue " << dendl;
+    dout(0) << __func__ << " seind signal to wake up sd queue " << sd_entries.size() << dendl;
   }
 }
 
@@ -625,9 +827,11 @@ void ReplicatedBackend::op_commit(
     const MOSDOp *m = NULL;
     if (op->op)
       m = static_cast<const MOSDOp *>(op->op->get_req());
+#if 0
     if (m) 
       dout(0) << __func__ << " op is completed " << m->get_hobj()
 	      << dendl;
+#endif
     op->on_commit->complete(0);
     op->on_commit = 0;
     in_progress_ops.erase(op->tid);
@@ -683,9 +887,11 @@ void ReplicatedBackend::do_repop_reply(OpRequestRef op)
 
     if (ip_op.waiting_for_commit.empty() &&
         ip_op.on_commit) {
+#if 0
       if (m) 
 	dout(0) << __func__ << " op is completed " << m->get_hobj()
 		<< dendl;
+#endif
       ip_op.on_commit->complete(0);
       ip_op.on_commit = 0;
       in_progress_ops.erase(iter);
@@ -1112,6 +1318,48 @@ void ReplicatedBackend::do_repop(OpRequestRef op)
 
   const hobject_t& soid = m->poid;
 
+  if (m->acks_wanted & CEPH_OSD_FLAG_NULL_TEST_BACKEND_DO_NOTHING) {
+    return;
+  } else if (m->acks_wanted & CEPH_OSD_FLAG_NULL_TEST_BACKEND_DO_FLUSH) {
+    sd_entry * en = new sd_entry;
+    bool direct_io = cct->_conf->issue_io_first_direct_io;
+    bool async_io = cct->_conf->issue_io_first_async_io;
+    bool null_test = cct->_conf->issue_io_first_null_test;
+
+    auto p = const_cast<bufferlist&>(m->get_data()).cbegin();
+    ObjectStore::Transaction opt;
+    decode(opt, p);
+    en->tls.reserve(1);
+    en->tls.push_back(std::move(opt));
+    en->op = op;
+    if (cct->_conf->osd_affinity_enable) {
+      op->sd_index = sched_getcpu() % cct->_conf->osd_threads_sd;
+    } else {
+      op->sd_index = -1;
+    }
+    uint64_t new_sd_seq = inc_sd_seq();
+    en->pgid = get_parent()->whoami_spg_t();
+    en->type = SECONDARY_SD_IO;
+    en->sd_seq = new_sd_seq;
+    // enalbe selective dispath
+    // disable selective dispatch
+    if (async_io) {
+      sd_enqueue(en, soid.oid);
+    } else if (null_test) {
+      null_test = true;
+    } else if (direct_io) {
+      //parent->queue_transactions_thin(en->tls, en->op);
+      vector< sd_entry *> ops_list;
+      ops_list.push_back(en);
+      parent->queue_transactions_thin_batch(ops_list, ops_list[0]->op);
+    }
+    if (direct_io || null_test) {
+      delete en;
+    }
+    return;
+    //dout(0) << __func__ << " m " << *m << " length " << m->get_cost() << dendl;
+  }
+
 #if 0
 #ifdef ENABLE_SELECTIVE_DISPATCH
   // selective dispatch
@@ -1218,40 +1466,96 @@ void ReplicatedBackend::do_repop(OpRequestRef op)
 #ifdef ENABLE_SELECTIVE_DISPATCH
   bool is_sd = false;
   if (op->get_req()->get_data().length() >= 4096 &&
-      cct->_conf->osd_selective_dispatch_enable) {
+      cct->_conf->osd_selective_dispatch_enable &&
+      is_sr_request(soid)) {
     is_sd = true;
     op->is_sr_op = true;
   }
+#if 0
   dout(0) << __func__ << " is_sd " << is_sd 
 	  << " length compare 1. message : " << op->get_req()->get_data().length()
 	  << " 2. mosdop : " << m->get_data().length() 
 	  << " opt " << rm->opt.get_data_length() 
 	  << " localt " << rm->localt.get_data_length() << dendl;
+#endif
   if (is_sd == false) {
   rm->opt.register_on_commit(
     parent->bless_context(
       new C_OSD_RepModifyCommit(this, rm)));
   }
 #endif
+
+#if 0
   vector<ObjectStore::Transaction> tls;
   tls.reserve(2);
   tls.push_back(std::move(rm->localt));
   tls.push_back(std::move(rm->opt));
+#endif
 #ifdef ENABLE_SELECTIVE_DISPATCH
+  vector<ObjectStore::Transaction> tls;
   //
   uint64_t new_sd_seq = inc_sd_seq();
+  bool has_write_op = true;
+#if 0
+  {
+    ObjectStore::Transaction::iterator i = rm->localt.begin();
+    for (int pos = 0; i.have_op(); ++pos) {
+      ObjectStore::Transaction::Op *op = i.decode_op();
+      if (op->op == ObjectStore::Transaction::OP_WRITE) {
+	has_write_op = true;
+      }
+    }
+  }
+#endif
   // queue
-  if (is_sd) {
+  if (is_sd && has_write_op) {
     sd_entry * en = new sd_entry;
-    en->tls = tls;
+    bool direct_io = cct->_conf->issue_io_first_direct_io;
+    bool async_io = cct->_conf->issue_io_first_async_io;
+    bool null_test = cct->_conf->issue_io_first_null_test;
+
+    if (op->sr_type == FRONT_ACK_BACKEND_DO_NOTHING) {
+      null_test = true;
+    }
+
+    //en->tls = tls;
+    en->tls.reserve(2);
+    en->tls.push_back(std::move(rm->localt));
+    en->tls.push_back(std::move(rm->opt));
     en->op = op;
+    if (cct->_conf->osd_affinity_enable) {
+      op->sd_index = sched_getcpu() % cct->_conf->osd_threads_sd;
+    } else {
+      op->sd_index = -1;
+    }
     en->pgid = get_parent()->whoami_spg_t();
     en->type = SECONDARY_SD_IO;
     en->sd_seq = new_sd_seq;
-    sd_enqueue(en, soid.oid);
+    // enalbe selective dispath
+    // disable selective dispatch
+    if (async_io) {
+      sd_enqueue(en, soid.oid);
+    } else if (null_test) {
+      null_test = true;
+    } else if (direct_io) {
+      parent->queue_transactions_thin(en->tls, en->op);
+    }
     repop_commit(rm);
+
+    if (direct_io || null_test) {
+      delete en;
+    }
     return;
+  } else {
+    tls.reserve(2);
+    tls.push_back(std::move(rm->localt));
+    tls.push_back(std::move(rm->opt));
   }
+#else
+  vector<ObjectStore::Transaction> tls;
+  tls.reserve(2);
+  tls.push_back(std::move(rm->localt));
+  tls.push_back(std::move(rm->opt));
 #endif
   parent->queue_transactions(tls, op);
   // op is cleaned up by oncommit/onapply when both are executed
@@ -1274,15 +1578,24 @@ void ReplicatedBackend::repop_commit(RepModifyRef rm)
 
   get_parent()->update_last_complete_ondisk(rm->last_complete);
 
-  MOSDRepOpReply *reply = new MOSDRepOpReply(
-    m,
-    get_parent()->whoami_shard(),
-    0, get_osdmap_epoch(), m->get_min_epoch(), CEPH_OSD_FLAG_ONDISK);
-  reply->set_last_complete_ondisk(rm->last_complete);
-  reply->set_priority(CEPH_MSG_PRIO_HIGH); // this better match ack priority!
-  reply->trace = rm->op->pg_trace;
-  get_parent()->send_message_osd_cluster(
-    rm->ackerosd, reply, get_osdmap_epoch());
+  if (rm->op->sr_type != FRONT_ACK_BACKEND_DO_NOTHING) {
+    MOSDRepOpReply *reply = new MOSDRepOpReply(
+      m,
+      get_parent()->whoami_shard(),
+      0, get_osdmap_epoch(), m->get_min_epoch(), CEPH_OSD_FLAG_ONDISK);
+    reply->set_last_complete_ondisk(rm->last_complete);
+    reply->set_priority(CEPH_MSG_PRIO_HIGH); // this better match ack priority!
+    reply->trace = rm->op->pg_trace;
+    // selective dispatch
+    if (rm->op->is_sr_op_direct_return) {
+      dout(0) << __func__ << " repop reply return direct " << dendl;
+      get_parent()->send_message_osd_cluster_direct(
+	rm->ackerosd, reply, get_osdmap_epoch());
+    } else {
+      get_parent()->send_message_osd_cluster(
+	rm->ackerosd, reply, get_osdmap_epoch());
+    }
+  }
 
   log_subop_stats(get_parent()->get_logger(), rm->op, l_osd_sop_w);
 }

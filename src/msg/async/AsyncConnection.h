@@ -60,6 +60,8 @@ class AsyncConnection : public Connection {
   ssize_t write(bufferlist &bl, std::function<void(ssize_t)> callback,
                 bool more=false);
   ssize_t _try_send(bool more=false);
+  // selective dispath
+  ssize_t _try_send_direct(bool more=false);
 
   void _connect();
   void _stop();
@@ -124,6 +126,7 @@ class AsyncConnection : public Connection {
 	      const entity_addr_t &listen_addr,
 	      const entity_addr_t &peer_addr);
   int send_message(Message *m) override;
+  int send_message_direct(Message *m) override;
 
   void send_keepalive() override;
   void mark_down() override;

@@ -330,6 +330,29 @@ public:
 			  OpRequestRef op) override {
     osd->store->queue_transactions(ch, tls, op, NULL);
   }
+  void queue_transaction_thin(ObjectStore::Transaction&& t,
+			 OpRequestRef op, bool thinstore_enable) override {
+    if (cct->_conf->thinstore_enable && thinstore_enable) {
+      assert(osd->get_thinstore());
+      osd->get_thinstore()->queue_transaction(ch, std::move(t), op, NULL, op->sd_index);
+    } else {
+      osd->store->queue_transaction(ch, std::move(t), op);
+    }
+  }
+  void queue_transactions_thin(vector<ObjectStore::Transaction>& tls,
+			  OpRequestRef op, bool thinstore_enable) override {
+    if (cct->_conf->thinstore_enable && thinstore_enable) {
+      assert(osd->get_thinstore());
+      osd->get_thinstore()->queue_transactions(ch, tls, op, NULL, op->sd_index);
+    } else {
+      osd->store->queue_transactions(ch, tls, op, NULL);
+    }
+  }
+  void queue_transactions_thin_batch(vector<struct sd_entry*> ops_list,
+				    OpRequestRef op, bool thinstore_enable) override {
+    assert(osd->get_thinstore());
+    osd->get_thinstore()->queue_transactions(ch, ops_list, op->sd_index);
+  }
   epoch_t get_interval_start_epoch() const override {
     return info.history.same_interval_since;
   }
@@ -516,6 +539,9 @@ public:
   }
   void send_message_osd_cluster(
     int peer, Message *m, epoch_t from_epoch) override;
+  // selective dispath
+  void send_message_osd_cluster_direct(
+    int peer, Message *m, epoch_t from_epoch) override;
   void send_message_osd_cluster(
     Message *m, Connection *con) override;
   void send_message_osd_cluster(
@@ -692,6 +718,25 @@ public:
 	snapset = &obc->ssc->snapset;
       }
     }
+    // selective dispatch
+    OpContext(OpRequestRef _op, osd_reqid_t _reqid, vector<OSDOp>* _ops,
+	      ObjectContextRef& obc,
+	      PrimaryLogPG *_pg, bool is_fast) :
+      op(_op), reqid(_reqid), ops(_ops),
+      snapset(0),
+      new_obs(obs->oi, obs->exists),
+      modify(false), user_modify(false), undirty(false), cache_evict(false),
+      ignore_cache(false), ignore_log_op_stats(false), update_log_only(false),
+      bytes_written(0), bytes_read(0), user_at_version(0),
+      current_osd_subop_num(0),
+      obc(obc),
+      reply(NULL), pg(_pg),
+      num_read(0),
+      num_write(0),
+      sent_reply(false),
+      inflightreads(0),
+      lock_type(ObjectContext::RWState::RWNONE) {
+    }
     OpContext(OpRequestRef _op, osd_reqid_t _reqid,
               vector<OSDOp>* _ops, PrimaryLogPG *_pg) :
       op(_op), reqid(_reqid), ops(_ops), obs(NULL), snapset(0),
@@ -712,7 +757,12 @@ public:
       }
     }
     ~OpContext() {
+      // selective dispatch for debug
+      if (op && (op->is_sr_op || op->sr_type == FRONT_ACK_BACKEND_DO_NOTHING)) {
+	int i = 0;
+      } else {
       ceph_assert(!op_t);
+      }
       if (reply)
 	reply->put();
       for (list<pair<boost::tuple<uint64_t, uint64_t, unsigned>,
@@ -1025,7 +1075,8 @@ protected:
   ObjectContextRef get_object_context(
     const hobject_t& soid,
     bool can_create,
-    const map<string, bufferlist> *attrs = 0
+    const map<string, bufferlist> *attrs = 0,
+    bool sr_fast = false
     );
 
   void context_registry_on_change();
@@ -1036,7 +1087,8 @@ protected:
 			  ObjectContextRef *pobc,
 			  bool can_create,
 			  bool map_snapid_to_clone=false,
-			  hobject_t *missing_oid=NULL);
+			  hobject_t *missing_oid=NULL,
+			  bool sr_fast = false);
 
   void add_object_context_to_pg_stat(ObjectContextRef obc, pg_stat_t *stat);
 
@@ -1484,7 +1536,23 @@ public:
   void do_request(
     OpRequestRef& op,
     ThreadPool::TPHandle &handle) override;
+  void fast_do_request(
+    OpRequestRef& op,
+    ThreadPool::TPHandle &handle,
+    struct sd_queue_entry *sd_q_entry = NULL);
   void do_op(OpRequestRef& op);
+  // selective dispatch
+  void fast_do_op(OpRequestRef& op, struct sd_queue_entry *sd_q_entry = NULL);
+  void fast_execute_ctx(OpContext *ctx);
+  //int fast_prepare_transaction(OpContext *ctx, bool is_fast);
+  int fast_prepare_transaction(OpContext *ctx, bool is_fast, 
+			      ObjectStore::Transaction *op_t);
+  int fast_do_osd_ops(OpContext *ctx, vector<OSDOp>& ops, 
+				    ObjectStore::Transaction *op_t);
+  int fast_fast_do_osd_ops(const hobject_t &soid, vector<OSDOp>& ops, 
+			  ObjectStore::Transaction *op_t, OpRequestRef orig_op,
+			  int sd_index = -1);
+
   void record_write_error(OpRequestRef op, const hobject_t &soid,
 			  MOSDOpReply *orig_reply, int r);
   void do_pg_op(OpRequestRef op);
@@ -1915,6 +1983,10 @@ public:
   }
   uint64_t get_sd_seq(spg_t pgid) {
     return osd->get_sd_seq(pgid);
+  }
+  // thinstore
+  ObjectStore * get_thinstore() {
+    return osd->get_thinstore();
   }
   int rep_repair_primary_object(const hobject_t& soid, OpContext *ctx);
 

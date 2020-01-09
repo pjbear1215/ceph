@@ -23,6 +23,7 @@
 #include "bluestore/BlueStore.h"
 #endif
 #include "kstore/KStore.h"
+#include "thinstore/thinstore.h"
 
 ObjectStore *ObjectStore::create(CephContext *cct,
 				 const string& type,
@@ -55,6 +56,10 @@ ObjectStore *ObjectStore::create(CephContext *cct,
   if (type == "kstore" &&
       cct->check_experimental_feature_enabled("kstore")) {
     return new KStore(cct, data);
+  }
+  // thinstore
+  if (type == "thinstore") {
+    return new ThinStore(cct, data);
   }
   return NULL;
 }

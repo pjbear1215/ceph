@@ -219,12 +219,34 @@ public:
     tls.push_back(std::move(t));
     return queue_transactions(ch, tls, op, handle);
   }
+  
+  // selective dispatch
+  int queue_transaction(CollectionHandle& ch,
+			Transaction&& t,
+			TrackedOpRef op,
+			ThreadPool::TPHandle *handle,
+			int sd_index) {
+    std::vector<Transaction> tls;
+    tls.push_back(std::move(t));
+    return queue_transactions(ch, tls, op, handle, sd_index);
+  }
 
   virtual int queue_transactions(
     CollectionHandle& ch, std::vector<Transaction>& tls,
     TrackedOpRef op = TrackedOpRef(),
     ThreadPool::TPHandle *handle = NULL) = 0;
 
+  // selective dispath
+  virtual int queue_transactions(
+    CollectionHandle& ch, std::vector<Transaction>& tls,
+    TrackedOpRef op,
+    ThreadPool::TPHandle *handle,
+    int sd_index) {return 0;}
+
+  virtual int queue_transactions(
+    CollectionHandle& ch, std::vector<struct sd_entry*> ops_list,
+    int sd_index) {return 0;}
+  virtual void set_orig_store(ObjectStore *ostore, int whoami) {}
 
  public:
   ObjectStore(CephContext* cct,
@@ -464,6 +486,16 @@ public:
      ceph::buffer::list& bl,
      uint32_t op_flags = 0) = 0;
 
+   // selective dispatch
+   virtual int read(
+     CollectionHandle &c,
+     const ghobject_t& oid,
+     uint64_t offset,
+     size_t len,
+     ceph::buffer::list& bl,
+     uint32_t op_flags,
+     int sd_index) {return 0;}
+
   /**
    * fiemap -- get extent std::map of data of an object
    *
@@ -699,6 +731,19 @@ public:
   virtual bool has_builtin_csum() const {
     return false;
   }
+};
+
+// selective dispatch
+#include "osd/OpRequest.h"
+class sd_entry {
+  public:
+    vector<ObjectStore::Transaction> tls;
+    OpRequestRef op;
+    spg_t pgid;
+    object_t oid;
+    int type;
+    eversion_t at_version;
+    uint64_t sd_seq;
 };
 
 #endif

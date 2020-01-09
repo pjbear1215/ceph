@@ -130,6 +130,9 @@ public:
    * @return 0 on success, or -errno on failure.
    */
   virtual int send_message(Message *m) = 0;
+  
+  // selective dispath
+  virtual int send_message_direct(Message *m) {return 0;}
 
   virtual int send_message2(MessageRef m)
   {

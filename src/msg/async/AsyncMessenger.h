@@ -339,6 +339,8 @@ public:
   /// con used for sending messages to ourselves
   AsyncConnectionRef local_connection;
 
+  // selective dispatch for debug
+  std::string mname;
   /**
    * @defgroup AsyncMessenger internals
    * @{

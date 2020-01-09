@@ -11,6 +11,14 @@
 // @c ConfigProxy is a facade of multiple config related classes. it exposes
 // the legacy settings with arrow operator, and the new-style config with its
 // member methods.
+
+#define SD_PATH 0
+#define SD_BASE_CORE 1
+#include <boost/lexical_cast.hpp>
+#include <boost/algorithm/string.hpp>
+#include "common/safe_io.h"
+
+
 class ConfigProxy {
   static ConfigValues get_config_values(const ConfigProxy &config_proxy) {
     std::lock_guard locker(config_proxy.lock);
@@ -105,6 +113,50 @@ class ConfigProxy {
   }
 
 public:
+  // selective dispath
+
+  std::string get_sr_config(int type, int osd_num)
+  {
+#if 0
+    char buf[48] = {0};
+    snprintf(buf, sizeof(buf), "osd%d_path", osd_num);
+    std::string osd_string = buf;
+    std::string value = get_val<std::string>(osd_string);
+    std::vector<std::string> feature_names;
+    boost::split(feature_names, value, boost::is_any_of(","));
+    ceph_assert(feature_names.size());
+    if (type >= 2) {
+      ceph_assert(0);
+    }
+    return feature_names[type];
+#endif
+    char buf[4096] = {0};
+    std::string data_path = get_val<std::string>("osd_data");
+    if (type == SD_PATH) {
+      int r = safe_read_file(data_path.c_str(), "sd_path",
+	      buf, sizeof(buf));
+      if (r <= 0)
+	return string();
+      // drop trailing newlines
+      while (r && isspace(buf[r-1])) {
+	--r;
+      }
+      return string(buf, r);
+    } else if (type == SD_BASE_CORE) {
+      int r = safe_read_file(data_path.c_str(), "sd_affinity",
+	      buf, sizeof(buf));
+      if (r <= 0)
+	return string();
+      // drop trailing newlines
+      while (r && isspace(buf[r-1])) {
+	--r;
+      }
+      return string(buf, r);
+    }
+
+    ceph_assert(0);
+  }
+
   explicit ConfigProxy(bool is_daemon)
     : config{values, obs_mgr, is_daemon}
   {}

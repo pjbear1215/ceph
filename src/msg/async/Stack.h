@@ -233,6 +233,7 @@ class Worker {
   EventCenter center;
 
   int cpu_affinity;
+  entity_name_t whoami_name;
 
   Worker(const Worker&) = delete;
   Worker& operator=(const Worker&) = delete;
@@ -361,6 +362,8 @@ class NetworkStack {
   virtual void ready() { };
 public:
   int osd_whoami;
+  entity_name_t whoami_name;
+  bool is_osd = false;
 };
 
 #endif //CEPH_MSG_ASYNC_STACK_H

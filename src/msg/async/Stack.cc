@@ -37,6 +37,8 @@
 std::function<void ()> NetworkStack::add_thread(unsigned i)
 {
   Worker *w = workers[i];
+  // selective dispatch
+  w->whoami_name = whoami_name;
   return [this, w]() {
       char tp_name[16];
       sprintf(tp_name, "msgr-worker-%u", w->id);
@@ -45,7 +47,7 @@ std::function<void ()> NetworkStack::add_thread(unsigned i)
       w->center.set_owner();
       ldout(cct, 10) << __func__ << " starting" << dendl;
 
-      if (cct->_conf->osd_affinity_enable) {
+      if (cct->_conf->osd_affinity_enable && cct->_conf->name.is_osd()) {
 	int cpu = w->cpu_affinity;
 	cpu_set_t set;
 	CPU_ZERO(&set);
@@ -59,20 +61,27 @@ std::function<void ()> NetworkStack::add_thread(unsigned i)
         if (s != 0) {
 	  ldout(cct, 0) << __func__ << " error occur during configuring affinity " << dendl;
 	}
-	ldout(cct, 0) << __func__ << " pin this thread to cpu " << cpu << dendl;
+	ldout(cct, 0) << __func__ << " this is osd, pin this thread to cpu " << cpu << dendl;
+	//lderr(cct) << __func__ << " this is osd, pin this thread to cpu " << cpu << dendl;
 
       }
       //ldout(cct, 0) << __func__ << " omw process_events...." << dendl;
 
       w->initialize();
       w->init_done();
+      //lderr(cct) << __func__ << " omw msg thread cpu? " << w->cpu_affinity  << dendl;
       //ldout(cct, 0) << __func__ << " omw process_events...." << dendl;
       while (!w->done) {
         ldout(cct, 30) << __func__ << " calling event process" << dendl;
-        //ldout(cct, 0) << " omw debug process_events " << test << " affinity " << w->cpu_affinity << dendl;
+#if 0
+        ldout(cct, 0) << " whoami_name " <<  whoami_name <<  " is_osd " << this->whoami_name.is_osd() 
+		      << " worker whoami_name " << w->whoami_name << " is osd " << is_osd << dendl;
+        ldout(cct, 0) << " omw debug process_events " << test << " affinity " << w->cpu_affinity << dendl;
         ldout(cct, 0) << " omw debug process_events " <<  " affinity " << w->cpu_affinity 
 		      << " cur affinity " << sched_getcpu() << dendl;
-
+        ldout(cct, 0) << " omw debug process_events " <<  " affinity " << w->cpu_affinity 
+		      << " cur affinity " << sched_getcpu() << dendl;
+#endif
 
         ceph::timespan dur;
         int r = w->center.process_events(EventMaxWaitUs, &dur);
@@ -156,8 +165,14 @@ void NetworkStack::start()
   std::unique_lock<decltype(pool_spin)> lk(pool_spin);
 
   if (started) {
+  ldout(cct, 0) << __func__ << " already started ?name " << whoami_name << dendl;
+  lderr(cct) << __func__ << " already started ?name " << whoami_name << dendl;
     return ;
   }
+
+  // selective dispath
+  ldout(cct, 0) << __func__ << " name " << whoami_name << dendl;
+  lderr(cct) << __func__ << " name " << whoami_name << dendl;
 
   for (unsigned i = 0; i < num_workers; ++i) {
     if (workers[i]->is_init())

@@ -508,5 +508,7 @@ WRITE_EQ_OPERATORS_4(ghobject_t, max, shard_id, hobj, generation)
 
 extern int cmp(const ghobject_t& l, const ghobject_t& r);
 
+// selective dispath
+extern bool is_sr_request(const hobject_t& obj);
 
 #endif
