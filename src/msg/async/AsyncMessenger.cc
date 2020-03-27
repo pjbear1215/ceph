@@ -576,6 +576,7 @@ void AsyncMessenger::add_accept(Worker *w, ConnectedSocket cli_socket,
   ldout(cct, 0) << __func__ << " listen_addr " << listen_addr << " peer_addr "
 		<< peer_addr << " affinity " << w->cpu_affinity 
 		<< " is osd " << conn->peer_is_osd() << " type " << this->mname
+		<< " peer name " << conn->peer_name 
 		<< dendl;
   conn->accept(std::move(cli_socket), listen_addr, peer_addr);
   accepting_conns.insert(conn);
@@ -604,7 +605,21 @@ AsyncConnectionRef AsyncMessenger::create_connect(
   }
 
   // create connection
-  Worker *w = stack->get_worker();
+  Worker *w;
+  if (cct->_conf->osd_affinity_enable) {
+    if (type == CEPH_ENTITY_TYPE_OSD && this->mname == "cluster") {
+      ldout(cct, 0) << __func__ << " this connection is for osd !!" << dendl;
+      w = stack->get_worker_for_sd(last_alloc_cluster);
+    } else if (type == CEPH_ENTITY_TYPE_CLIENT && this->mname == "client") {
+      ldout(cct, 0) << __func__ << " this connection is for client !!" << dendl;
+      w = stack->get_worker_for_sd(last_alloc_client);
+    } else {
+      w = stack->get_worker();
+    }
+  } else {
+  //Worker *w = stack->get_worker();
+    w = stack->get_worker();
+  }
   AsyncConnectionRef conn = new AsyncConnection(cct, this, &dispatch_queue, w,
 						target.is_msgr2(), false);
   conn->connect(addrs, type, target);
@@ -612,11 +627,21 @@ AsyncConnectionRef AsyncMessenger::create_connect(
   ldout(cct, 10) << __func__ << " " << conn << " " << addrs << " "
 		 << *conn->peer_addrs << dendl;
   // selective dispath for debug
-  ldout(cct, 0) << __func__ << " " << conn << " " << addrs << " "
+  ldout(cct, 0) << __func__ << " " << conn << " addr " << addrs << " "
 		 << *conn->peer_addrs << " is osd " << conn->peer_is_osd() 
-		 << " affinity " << w->cpu_affinity << " type " << this->mname << dendl;
+		 << " affinity " << w->cpu_affinity << " type " << this->mname 
+		  << " int type " << type 
+		  << " peer name " << conn->peer_name 
+		  << dendl;
 
   conns[addrs] = conn;
+  // selective dispath for debug
+  if (this->mname == "cluster") {
+    for (auto p :conns)
+    {
+      ldout(cct, 0) << __func__ << " cluster addr " << p << dendl;
+    }
+  }
   w->get_perf_counter()->inc(l_msgr_active_connections);
 
   return conn;
@@ -885,6 +910,19 @@ int AsyncMessenger::accept_conn(const AsyncConnectionRef& conn)
   }
   ldout(cct, 10) << __func__ << " " << conn << " " << *conn->peer_addrs << dendl;
   conns[*conn->peer_addrs] = conn;
+  // selective dispath for debug
+  ldout(cct, 0) << __func__ << " " << conn << " peer addr "
+		 << *conn->peer_addrs << " is osd " << conn->peer_is_osd() 
+		 << " type " << this->mname 
+		  << " peer name " << conn->peer_name 
+		  << dendl;
+  // selective dispath for debug
+  if (this->mname == "cluster") {
+    for (auto p :conns)
+    {
+      ldout(cct, 0) << __func__ << "cluster addr " << p << dendl;
+    }
+  }
   conn->get_perf_counter()->inc(l_msgr_active_connections);
   accepting_conns.erase(conn);
   return 0;

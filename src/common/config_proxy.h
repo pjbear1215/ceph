@@ -115,7 +115,7 @@ class ConfigProxy {
 public:
   // selective dispath
 
-  std::string get_sr_config(int type, int osd_num)
+  std::string get_sr_config(std::string data_path, int type, int osd_num)
   {
 #if 0
     char buf[48] = {0};
@@ -131,7 +131,7 @@ public:
     return feature_names[type];
 #endif
     char buf[4096] = {0};
-    std::string data_path = get_val<std::string>("osd_data");
+    //std::string data_path = get_val<std::string>("osd_data");
     if (type == SD_PATH) {
       int r = safe_read_file(data_path.c_str(), "sd_path",
 	      buf, sizeof(buf));

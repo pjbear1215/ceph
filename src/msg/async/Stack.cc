@@ -49,20 +49,22 @@ std::function<void ()> NetworkStack::add_thread(unsigned i)
 
       if (cct->_conf->osd_affinity_enable && cct->_conf->name.is_osd()) {
 	int cpu = w->cpu_affinity;
-	cpu_set_t set;
-	CPU_ZERO(&set);
-	CPU_SET(cpu, &set);
-#if 0
-	if (sched_setaffinity(getpid(), sizeof(cpu_set_t), &set)) {
-	  ldout(cct, 0) << __func__ << " error occur during configuring affinity " << dendl;
+	if (cpu != -1) {
+	  cpu_set_t set;
+	  CPU_ZERO(&set);
+	  CPU_SET(cpu, &set);
+  #if 0
+	  if (sched_setaffinity(getpid(), sizeof(cpu_set_t), &set)) {
+	    ldout(cct, 0) << __func__ << " error occur during configuring affinity " << dendl;
+	  }
+  #endif
+	  int s = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &set);
+	  if (s != 0) {
+	    ldout(cct, 0) << __func__ << " error occur during configuring affinity " << dendl;
+	  }
+	  ldout(cct, 0) << __func__ << " this is osd, pin this thread to cpu " << cpu << dendl;
+	  //lderr(cct) << __func__ << " this is osd, pin this thread to cpu " << cpu << dendl;
 	}
-#endif
-	int s = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &set);
-        if (s != 0) {
-	  ldout(cct, 0) << __func__ << " error occur during configuring affinity " << dendl;
-	}
-	ldout(cct, 0) << __func__ << " this is osd, pin this thread to cpu " << cpu << dendl;
-	//lderr(cct) << __func__ << " this is osd, pin this thread to cpu " << cpu << dendl;
 
       }
       //ldout(cct, 0) << __func__ << " omw process_events...." << dendl;
@@ -152,8 +154,21 @@ NetworkStack::NetworkStack(CephContext *c, const string &t): type(t), started(fa
   for (unsigned i = 0; i < num_workers; ++i) {
     Worker *w = create_worker(cct, type, i);
     if (cct->_conf->osd_affinity_enable) {
-      w->cpu_affinity = (osd_whoami % cct->_conf->osd_per_node) *
-				cct->_conf->osd_threads_sd + i;
+      if (cct->_conf->name.is_osd()) {
+	string p = cct->_conf.get_sr_config(cct->_conf->osd_data, SD_BASE_CORE, osd_whoami);
+	ldout(cct, 0) << __func__ << " network thread sd affinity " << w->cpu_affinity << " p " << p << dendl;
+	if (!p.length() || p.empty()) {
+	  w->cpu_affinity = -1;
+	} else {
+	  w->cpu_affinity = std::stoi(p);
+	  w->cpu_affinity = w->cpu_affinity + i;
+	  ldout(cct, 0) << __func__ << " network thread sd affinity " << w->cpu_affinity << dendl;
+    #if 0
+	  w->cpu_affinity = (osd_whoami % cct->_conf->osd_per_node) *
+				    cct->_conf->osd_threads_sd + i;
+    #endif
+	}
+      }
     }
     w->center.init(InitEventNumber, i, type);
     workers.push_back(w);
@@ -210,6 +225,33 @@ Worker* NetworkStack::get_worker()
   pool_spin.unlock();
   ceph_assert(current_best);
   ++current_best->references;
+  return current_best;
+}
+
+Worker* NetworkStack::get_worker_for_sd(int &last_alloc_num)
+{
+  ldout(cct, 30) << __func__ << dendl;
+
+   // start with some reasonably large number
+  unsigned min_load = std::numeric_limits<int>::max();
+  Worker* current_best = nullptr;
+
+  pool_spin.lock();
+  // find worker with least references
+  // tempting case is returning on references == 0, but in reality
+  // this will happen so rarely that there's no need for special case.
+  if (last_alloc_num == -1) {
+    last_alloc_num = 0;
+  } else {
+    last_alloc_num++;
+    if (last_alloc_num >= num_workers) {
+      last_alloc_num = 0;
+    }
+  }
+  current_best = workers[last_alloc_num];
+
+  pool_spin.unlock();
+  ceph_assert(current_best);
   return current_best;
 }
 

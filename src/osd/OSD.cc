@@ -296,8 +296,18 @@ OSDService::OSDService(OSD *osd) :
     struct SDThread *th = new SDThread(this, j);
     if (cct->_conf->osd_affinity_enable) {
       th->enable_affinity = true;
+      string p = cct->_conf.get_sr_config(cct->_conf->osd_data, SD_BASE_CORE, osd->whoami);
+      if (!cct->_conf->osd_level_batch_flush) {
+	th->cpu_affinity = std::stoi(p);
+	th->cpu_affinity = th->cpu_affinity + j;
+      } else {
+	th->cpu_affinity = std::stoi(p);
+	th->cpu_affinity += cct->_conf->ms_async_op_threads;
+      }
+#if 0
       th->cpu_affinity = (osd->whoami % cct->_conf->osd_per_node) * 
 			  cct->_conf->osd_threads_sd + j;
+#endif
     }
     sd_threads.push_back(th);
     sd_locks.push_back(new Mutex("OSDService::sd_mutex"));
@@ -635,8 +645,12 @@ void OSDService::enqueue_sd_entry(object_t oid, spg_t pgid, uint64_t seq, OpRequ
     // need check !!!!!!!!!!!!!!!!
     // need check !!!!!!!!!!!!!!!!
     //sd_index = cpu % num_threads_sd;
-    if (sd_index == 0 || sd_index == 1) {
-      sd_index += 2;
+    if (cct->_conf->osd_level_batch_flush) {
+      if (sd_index == 0 || sd_index == 1) {
+	sd_index += 2;
+      }
+    } else {
+      sd_index = cpu;
     }
     // ToDo
     // locality
@@ -959,7 +973,7 @@ void OSDService::sd_merge_entry(vector<struct sd_queue_entry> * list, int sd_ind
     ceph_assert(p.op);
     Message * m = p.op->get_nonconst_req();
 
-    dout(0) << __func__ << " sequence " << *m << dendl;
+    //dout(0) << __func__ << " sequence " << *m << dendl;
 
     if (p.op && m->get_type() == CEPH_MSG_OSD_OP && p.op->may_read()) {
       dout(0) << __func__ << " this is read op " << p.oid << dendl;
@@ -7813,7 +7827,7 @@ bool OSD::null_test(spg_t pgid, OpRequestRef op, PrimaryLogPG *plpg, PGRef pg, M
       pg->unlock();
       return true;
     }
-    service.sd_locks[index]->unlock();
+    service.sd_cache_ops_locks[index]->unlock();
   }
 
   return false;
@@ -7835,6 +7849,7 @@ bool OSD::fast_rep(spg_t pgid, OpRequestRef op, PrimaryLogPG *plpg, PGRef pg, Me
       dout(0) << __func__ << " warning !!! retry " << dendl;
       dout(0) << __func__ << " warning !!! retry " << dendl;
       dout(0) << __func__ << " warning !!! retry " << dendl;
+      ceph_assert(0);
     }
     op_m->finish_decode();
     hobject_t hoid = op_m->get_hobj().get_head();
@@ -7961,10 +7976,10 @@ bool OSD::fast_rep(spg_t pgid, OpRequestRef op, PrimaryLogPG *plpg, PGRef pg, Me
 #if 0
     dout(0) << __func__ << " rep op len " << m->get_data_len() 
 	    << " req id " << op->get_reqid() << " ackwant " << m->acks_wanted << dendl;
-#endif
     dout(0) << __func__ << " rep op len " << m->get_data_len() 
 	    << " req id " << op->get_reqid() << " ackwant " 
 	    << m->acks_wanted << " m " << *m << dendl;
+#endif
 
     if (m->acks_wanted & CEPH_OSD_FLAG_NULL_TEST_BACKEND_DO_FLUSH) {
       op->sr_type = FRONT_ACK_BACKEND_DO_FLUSH;
@@ -8084,7 +8099,7 @@ void OSD::do_sd_process(spg_t pgid, OpRequestRef op)
     }
     if (null_target) {
       if (null_test(pgid, op, plpg, pg, m)) {
-	dout(0) << __func__ << " null target " << *m << dendl;
+	//dout(0) << __func__ << " null target " << *m << dendl;
 	// already unblock pg
 	if (op->sr_type != FRONT_ACK_BACKEND_DO_NOTHING) {
 	  return;

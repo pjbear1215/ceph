@@ -184,7 +184,7 @@ int ThinStore::_open_bdev(bool create)
     p = cct->_conf->osd2_path;
   }
 #endif
-  p = cct->_conf.get_sr_config(SD_PATH, whoami);
+  p = cct->_conf.get_sr_config(cct->_conf->osd_data, SD_PATH, whoami);
 
   dout(0) << __func__ << " open bdev path " << p << " whoami " << whoami << dendl;
 
@@ -1550,6 +1550,7 @@ int ThinStore::_do_write(ThOnodeRef& o, uint64_t offset, size_t length, bufferli
     // need check !!!33
     // need check !!!33
     // need check !!!33
+#if 0
     dout(0) << __func__ << " is not 4MB !!! start === " << " oid " << o->oid <<  " n_head " 
 	    << n_head << " n_body " << n_body << " n_tail " << n_tail 
 	    << " bl.length " << bl.length() << " block size " << block_size 
@@ -1557,6 +1558,7 @@ int ThinStore::_do_write(ThOnodeRef& o, uint64_t offset, size_t length, bufferli
 	    << sd_index << " offset " << offset << " reamin_off " << remain_off
 	    << " allocateed_block " << allocated_block << " total block len " 
 	    << total_block_len << " thonode size " << o->thonode.size << dendl;
+#endif
 
   }
 

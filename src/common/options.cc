@@ -1,5 +1,5 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+
 
 #include "acconfig.h"
 #include "options.h"
@@ -3874,24 +3874,22 @@ std::vector<Option> get_global_options() {
     Option("sd_use_original_backend", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(false)
     .set_description("messenger_null_test"),
-#if 0
     // path, core
     Option("osd0_path", Option::TYPE_STR, Option::LEVEL_ADVANCED)
     .set_default(
-      "/dev/nvme0n1p2,0"
+      "/dev/nvme0n1p2"
     )
     .set_description(""),
     Option("osd1_path", Option::TYPE_STR, Option::LEVEL_ADVANCED)
     .set_default(
-      "/dev/nvme0n1p1,0"
+      "/dev/nvme0n1p1"
     )
     .set_description(""),
     Option("osd2_path", Option::TYPE_STR, Option::LEVEL_ADVANCED)
     .set_default(
-      "/dev/nvme1n1p1,0"
+      "/dev/nvme1n1p1"
     )
     .set_description(""),
-#endif
 
 
     // selective dispatch

@@ -353,6 +353,8 @@ class NetworkStack {
   unsigned get_num_worker() const {
     return num_workers;
   }
+  // selective dispatch
+  Worker* get_worker_for_sd(int &last_alloc_num);
 
   // direct is used in tests only
   virtual void spawn_worker(unsigned i, std::function<void ()> &&) = 0;

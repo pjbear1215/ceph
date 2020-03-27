@@ -341,6 +341,8 @@ public:
 
   // selective dispatch for debug
   std::string mname;
+  int last_alloc_cluster = -1;
+  int last_alloc_client  = -1;
   /**
    * @defgroup AsyncMessenger internals
    * @{
