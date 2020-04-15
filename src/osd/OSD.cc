@@ -292,10 +292,12 @@ OSDService::OSDService(OSD *osd) :
 
   // selective dispatch
   num_threads_sd = cct->_conf->osd_threads_sd;
+  int offset_sd_thread = 0;
   for (int j = 0; j < cct->_conf->osd_threads_sd; j++) {
     struct SDThread *th = new SDThread(this, j);
     if (cct->_conf->osd_affinity_enable) {
-      th->enable_affinity = true;
+      //th->enable_affinity = true;
+      th->enable_affinity = false;
       string p = cct->_conf.get_sr_config(cct->_conf->osd_data, SD_BASE_CORE, osd->whoami);
       if (!cct->_conf->osd_level_batch_flush) {
 	th->cpu_affinity = std::stoi(p);
@@ -303,6 +305,8 @@ OSDService::OSDService(OSD *osd) :
       } else {
 	th->cpu_affinity = std::stoi(p);
 	th->cpu_affinity += cct->_conf->ms_async_op_threads;
+	th->cpu_affinity += offset_sd_thread;
+	if (j != 0 && !(j%5)) offset_sd_thread++;
       }
 #if 0
       th->cpu_affinity = (osd->whoami % cct->_conf->osd_per_node) * 
@@ -646,11 +650,14 @@ void OSDService::enqueue_sd_entry(object_t oid, spg_t pgid, uint64_t seq, OpRequ
     // need check !!!!!!!!!!!!!!!!
     //sd_index = cpu % num_threads_sd;
     if (cct->_conf->osd_level_batch_flush) {
-      if (sd_index == 0 || sd_index == 1) {
-	sd_index += 2;
+      if (sd_index > num_threads_sd) {
+	sd_index = cpu % num_threads_sd;
       }
     } else {
       sd_index = cpu;
+      if (sd_index > num_threads_sd) {
+	sd_index = cpu % num_threads_sd;
+      }
     }
     // ToDo
     // locality
@@ -713,9 +720,12 @@ void OSDService::enqueue_sd_entry(object_t oid, spg_t pgid, uint64_t seq, OpRequ
       ceph_assert(op_m);
       ceph_assert(op_m->ops.size() == 1);
       hoid = op_m->get_hobj().get_head();
-      plpg->fast_fast_do_osd_ops(hoid, op_m->ops, NULL, op, sd_index);
-      sd_locks[sd_index]->Unlock();
-      return;
+       
+      if (!plpg->is_large_osd_ops(hoid, op_m->ops)) {
+	plpg->fast_fast_do_osd_ops(hoid, op_m->ops, NULL, op, sd_index);
+	sd_locks[sd_index]->Unlock();
+	return;
+      }
     }
   }
 
@@ -882,6 +892,7 @@ void OSDService::sd_merge_entry_flush(int index, bool need_flush, Mutex& sd_lock
       flush_size = sd_queue[index].size();
     }
     vector< struct sd_queue_entry > sd_entry_list;
+    bool need_unlock = true;
     while (flush_size > 0 && sd_queue[index].size() > 0) {
       sd_entry_list.push_back(sd_queue[index].front());
       sd_queue[index].pop_front();
@@ -893,14 +904,16 @@ void OSDService::sd_merge_entry_flush(int index, bool need_flush, Mutex& sd_lock
     if (sd_queue[index].size() > 0) {
       dout(0) << __func__ << " warning still sd_queue contains entries " << dendl;
     }
-
-    sd_lock_local.Unlock();
+    if (sd_entry_list.size() > (SD_ENTRY_KEEP_IN_MEMORY << 1) + 1) {
+      dout(0) << __func__ 
+	    << " sd_entry_list size is too big !! wanring..!! make flush.." 
+	      << sd_entry_list.size() << dendl;
+      need_unlock = false;
+    } else {
+      sd_lock_local.Unlock();
+    }
 
     ceph_assert(sd_entry_list.size());
-    if (sd_entry_list.size() > (SD_ENTRY_KEEP_IN_MEMORY << 1) + 1) {
-      dout(0) << __func__ << " sd_entry_list size is too big !! " 
-	      << sd_entry_list.size() << dendl;
-    }
 
     struct sd_queue_entry flush_entry = sd_entry_list.front();
     if (!flush_entry.op) {
@@ -925,7 +938,7 @@ void OSDService::sd_merge_entry_flush(int index, bool need_flush, Mutex& sd_lock
 	    << " cur cpu " << sched_getcpu() << dendl;
     auto sdata = osd->shards[shard_index];
     ceph_assert(sdata);
-    ceph_assert(osdmap->get_epoch() <= sdata->shard_osdmap->get_epoch());
+    //ceph_assert(osdmap->get_epoch() <= sdata->shard_osdmap->get_epoch());
     auto t = sdata->pg_slots.find(flush_entry.pgid);
     if (t == sdata->pg_slots.end()) {
       dout(0) << __func__ << " " << __LINE__ << " shard_index " << shard_index 
@@ -933,6 +946,7 @@ void OSDService::sd_merge_entry_flush(int index, bool need_flush, Mutex& sd_lock
 	      << " queue size " << sd_queue[index].size() 
 	      << " cur index " << index 
 	      << " cur cpu " << sched_getcpu() << dendl;
+      ceph_assert(0);
     }
     assert(t != sdata->pg_slots.end());
 
@@ -953,7 +967,9 @@ void OSDService::sd_merge_entry_flush(int index, bool need_flush, Mutex& sd_lock
     }
     flush_size--;
 
-    sd_lock_local.Lock();
+    if (need_unlock) {
+      sd_lock_local.Lock();
+    }
     if (sd_queue[index].size() == 0) {
       sd_queue_status[index] = (sd_queue_status[index] & ~NEED_FLUSH);
     }
@@ -976,7 +992,7 @@ void OSDService::sd_merge_entry(vector<struct sd_queue_entry> * list, int sd_ind
     //dout(0) << __func__ << " sequence " << *m << dendl;
 
     if (p.op && m->get_type() == CEPH_MSG_OSD_OP && p.op->may_read()) {
-      dout(0) << __func__ << " this is read op " << p.oid << dendl;
+      dout(40) << __func__ << " this is read op " << p.oid << dendl;
       read_ops.push_back(p);
       p.processed = true;
       continue;
@@ -1022,10 +1038,15 @@ void OSDService::sd_merge_entry(vector<struct sd_queue_entry> * list, int sd_ind
     }
   }
 
-  ceph_assert(ops_list.size());
+  if (!ops_list.size() && !read_ops.size()) {
+    ceph_assert(0);
+    //ceph_assert(ops_list.size());
+  }
   ceph_assert(osd->thinstore);
   //osd->thinstore->queue_transactions(ops_list, ops_list[0]->op, true);
-  plpg->queue_transactions_thin_batch(ops_list, ops_list[0]->op, true);
+  if (ops_list.size()) {
+    plpg->queue_transactions_thin_batch(ops_list, ops_list[0]->op, true);
+  }
 
   // read ops ? have to flush prior writes before processing read
   for (auto p : read_ops) {
@@ -1034,7 +1055,7 @@ void OSDService::sd_merge_entry(vector<struct sd_queue_entry> * list, int sd_ind
     MOSDOp *op_m = static_cast<MOSDOp*>(p.op->get_nonconst_req());
     ceph_assert(op_m);
     hobject_t hoid = op_m->get_hobj().get_head();
-    dout(0) << __func__ << " delayed read " << hoid << dendl;
+    dout(40) << __func__ << " delayed read " << hoid << dendl;
     plpg->fast_fast_do_osd_ops(hoid, op_m->ops, NULL, p.op, sd_index);
   }
 
@@ -1054,7 +1075,7 @@ void OSDService::sd_entry(int index)
       sd_conds[index]->Wait(sd_lock_local);
       continue;
     } else if (sd_queue_status[index] & NEED_FLUSH) {
-      dout(0) << __func__ << " need immediatly flush " << dendl;
+      dout(40) << __func__ << " need immediatly flush " << dendl;
     } else if (sd_queue[index].size() < SD_ENTRY_KEEP_IN_MEMORY) {
       dout(0) << __func__ << " warning... the size of queue " 
 	      << sd_queue[index].size() << dendl;
@@ -7596,7 +7617,11 @@ void OSD::ms_fast_dispatch(Message *m)
 	static_cast<MOSDFastDispatchOp*>(m)->get_map_epoch());
     } else {
       spg_t pgid = static_cast<MOSDFastDispatchOp*>(m)->get_spg();
-      //dout(0) << __func__ << " is sr m " << *m << dendl;
+      if (m->get_type() == CEPH_MSG_OSD_OP) {
+	if (!m->get_type() == MSG_OSD_REPOP && !m->get_type() == MSG_OSD_REPOPREPLY) {
+	  //dout(0) << __func__ << " is sr m " << *m << dendl;
+	}
+      }
       do_sd_process(pgid, op);
     }
   } else {
@@ -7868,7 +7893,7 @@ bool OSD::fast_rep(spg_t pgid, OpRequestRef op, PrimaryLogPG *plpg, PGRef pg, Me
       pg->unlock();
       return true;
     }
-    
+
     int r = plpg->fast_fast_do_osd_ops(hoid, op_m->ops, op_t, op);
     // Deletion case
     if (!op_t && r == 0) {
@@ -7915,6 +7940,10 @@ bool OSD::fast_rep(spg_t pgid, OpRequestRef op, PrimaryLogPG *plpg, PGRef pg, Me
       // dout(0) << __func__ << " op_t size " << op_t->get_num_ops() << dendl;
       // mark final_need as false to recognize that a message is selective patch
 
+      //ceph_assert(op_t);
+      if (!op_t) {
+	dout(0) << __func__ << " op_t is null ! " << dendl;
+      }
       encode(*op_t, wr->get_data());
       //encode(m->get_data(), wr->get_data());
 
@@ -7969,7 +7998,8 @@ bool OSD::fast_rep(spg_t pgid, OpRequestRef op, PrimaryLogPG *plpg, PGRef pg, Me
 
     if (!(m->acks_wanted & CEPH_OSD_FLAG_NULL_TEST)) {
       dout(0) << __func__ << " this likely is the target of null test, but no null test flag " << dendl;
-      dout(0) << __func__ << " this likely is the target of null test, but no null test flag " << " reqid " << op->get_reqid() << dendl;
+      dout(0) << __func__ << " this likely is the target of null test, but no null test flag " 
+	      << " reqid " << op->get_reqid() << " m " << *m << dendl;
       return false;
     }
     
@@ -8120,7 +8150,14 @@ void OSD::do_sd_process(spg_t pgid, OpRequestRef op)
 	if (op && m->get_data_len() > 0) {
 	  // this probably is a write op 
 	  op_t = new ObjectStore::Transaction;
-	}
+	} else {
+	  if (op) {
+	    MOSDOp *op_m = static_cast<MOSDOp*>(op->get_nonconst_req());
+	    if (plpg->is_write_osd_ops(op_m->ops)) {
+	      op_t = new ObjectStore::Transaction;
+	    }
+	  }
+	} 
       }
       if (fast_rep(pgid, op, plpg, pg, m, op_t, done)) {
 	if (m->get_type() != MSG_OSD_REPOPREPLY) {

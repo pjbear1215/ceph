@@ -10256,6 +10256,53 @@ int PrimaryLogPG::fast_do_osd_ops(OpContext *ctx, vector<OSDOp>& ops,
 }
 
 // selective dispatch for extreme fast
+bool PrimaryLogPG::is_write_osd_ops(vector<OSDOp>& ops) 
+{
+  for (auto p = ops.begin(); p != ops.end(); ++p) {
+    OSDOp& osd_op = *p;
+    ceph_osd_op& op = osd_op.op;
+
+    dout(30) << " fast_fast_do_osd_ops do_osd_op  " << osd_op   
+	    << " op.op " << op.op << dendl;
+
+    switch (op.op) {
+    case CEPH_OSD_OP_ZERO:
+    case CEPH_OSD_OP_TRUNCATE:
+      {
+	return true;
+      }
+    default:
+      return false;
+    }
+  }
+  return false;
+}
+
+bool PrimaryLogPG::is_large_osd_ops(const hobject_t& soid, vector<OSDOp>& ops) 
+{
+  for (auto p = ops.begin(); p != ops.end(); ++p) {
+    OSDOp& osd_op = *p;
+    ceph_osd_op& op = osd_op.op;
+
+    dout(30) << " fast_fast_do_osd_ops do_osd_op  " << osd_op << " oid " 
+	    << soid << " op.op " << op.op << dendl;
+
+    switch (op.op) {
+    case CEPH_OSD_OP_READ:
+    case CEPH_OSD_OP_WRITE:
+    case CEPH_OSD_OP_WRITEFULL:
+      {
+	if (op.extent.length > 4096) {
+	  return true;
+	}
+      }
+    default:
+      return false;
+    }
+  }
+  return false;
+
+}
 int PrimaryLogPG::fast_fast_do_osd_ops(const hobject_t& soid, vector<OSDOp>& ops, 
 				  ObjectStore::Transaction *op_t, OpRequestRef orig_op,
 				  int sd_index)
@@ -10287,6 +10334,45 @@ int PrimaryLogPG::fast_fast_do_osd_ops(const hobject_t& soid, vector<OSDOp>& ops
     switch (op.op) {
       
       // --- READS ---
+    case CEPH_OSD_OP_STAT:
+      {
+	uint64_t size;
+	utime_t mtime = ceph_clock_now();
+	result = pgbackend->thinstore_stat(soid, size, sd_index);
+	if (result < 0) {
+	  dout(0) << __func__ << " result " << result << dendl;
+	}
+	encode(size, osd_op.outdata);
+	encode(mtime, osd_op.outdata);
+	Message * m = orig_op->get_nonconst_req();
+	const MOSDOp *op_m = static_cast<const MOSDOp*>(orig_op->get_req());
+	MOSDOpReply *reply = new MOSDOpReply(op_m, 0, get_osdmap_epoch(), 0,
+					    true);
+	reply->claim_op_out_data(ops);
+	reply->get_header().data_off = op.extent.offset;
+	//dout(0) << __func__ << " op_read data length " << reply->get_data_len() << dendl;
+	if (result >= 0) {
+	  //log_op_stats(orig_op, 0, osd.extent.length);
+
+	  // on read, return the current object version
+	  reply->set_reply_versions(eversion_t(), version_t());
+#if 0
+	  if (ctx->obs) {
+	    reply->set_reply_versions(eversion_t(), version_t());
+	  } else {
+	    reply->set_reply_versions(eversion_t(), version_t());
+	  }
+#endif
+	} else if (result == -ENOENT) {
+	  // on ENOENT, set a floor for what the next user version will be.
+	  reply->set_enoent_reply_versions(eversion_t(), version_t());
+	}
+
+	reply->set_result(result);
+	reply->add_flags(CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK);
+	osd->send_message_osd_client(reply, m->get_connection());
+      }
+      break;
 
     case CEPH_OSD_OP_SYNC_READ:
       // need enable when testing thinstore under real workload condition
@@ -10306,7 +10392,7 @@ int PrimaryLogPG::fast_fast_do_osd_ops(const hobject_t& soid, vector<OSDOp>& ops
 	const MOSDOp *op_m = static_cast<const MOSDOp*>(orig_op->get_req());
 	MOSDOpReply *reply = new MOSDOpReply(op_m, 0, get_osdmap_epoch(), 0,
 					    true);
-	dout(0) << __func__ << " op_read " << soid << dendl;
+	//dout(0) << __func__ << " op_read " << soid << dendl;
 	ceph_assert(sd_index != -1);
 	result = pgbackend->objects_read_sync(
 	  soid, op.extent.offset, op.extent.length, op.flags, &osd_op.outdata,
@@ -10316,11 +10402,12 @@ int PrimaryLogPG::fast_fast_do_osd_ops(const hobject_t& soid, vector<OSDOp>& ops
 	if (osd_op.outdata.length() != op.extent.length) {
 	  dout(0) << __func__ << " omw wanring !!! length is different from extent.lwngth " 
 		  << " extent.length " << op.extent.length << " outdata " 
-		  << osd_op.outdata.length() << " m " << *m << dendl;
+		  << osd_op.outdata.length() << " m " << *m 
+		  << " result " << result << dendl;
 	}
 	reply->claim_op_out_data(ops);
 	reply->get_header().data_off = op.extent.offset;
-	dout(0) << __func__ << " op_read data length " << reply->get_data_len() << dendl;
+	//dout(0) << __func__ << " op_read data length " << reply->get_data_len() << dendl;
 	if (result >= 0) {
 	  //log_op_stats(orig_op, 0, osd.extent.length);
 
@@ -10490,6 +10577,53 @@ int PrimaryLogPG::fast_fast_do_osd_ops(const hobject_t& soid, vector<OSDOp>& ops
 	result = 0;
       }
       break;
+    case CEPH_OSD_OP_ZERO:
+      {
+
+	result = check_offset_and_length(
+	  op.extent.offset, op.extent.length,
+	  static_cast<Option::size_t>(osd->osd_max_object_size), get_dpp());
+	if (result < 0)
+	  break;
+
+	dout(0) << __func__ << " need a check, do we support op_zero? " << dendl;
+	//maybe_create_new_object(ctx);
+
+	if (op.extent.length == 0) {
+	  ceph_assert(0);
+	} else {
+	  // selective dispatch
+	  bufferlist zero_bl;
+	  zero_bl.append_zero(op.extent.length);
+
+	  if (orig_op && (orig_op->sr_type == FRONT_ACK_BACKEND_DO_NOTHING ||
+	      orig_op->sr_type == FRONT_ACK_BACKEND_DO_FLUSH)) {
+	    if (op_t) {
+	      const hobject_t &oid = soid;
+	      const ghobject_t goid =
+		ghobject_t(oid, ghobject_t::NO_GEN, shard_id_t::NO_SHARD);
+	dout(0) << __func__ << " need a check, do we support op_zero? " << dendl;
+	      op_t->write(
+		  coll,
+		  goid,
+		  op.extent.offset,
+		  op.extent.length,
+		  zero_bl);
+	      return 0;
+	    } else {
+	      ceph_assert(t);
+	      t->fast_write(
+		soid, op.extent.offset, op.extent.length, zero_bl, op.flags);
+	    }
+	  } else {
+	  ceph_assert(t);
+	  t->write(
+	    soid, op.extent.offset, op.extent.length, zero_bl, op.flags);
+	  }
+	}
+
+      }
+      break;
     case CEPH_OSD_OP_TRUNCATE:
       {
 	dout(0) << __func__ << " need a check, do we support op_truncate? " << dendl;
@@ -10508,9 +10642,14 @@ int PrimaryLogPG::fast_fast_do_osd_ops(const hobject_t& soid, vector<OSDOp>& ops
 	}
 	result = 0;
       }
-
+      break;
     default:
       tracepoint(osd, do_osd_op_pre_unknown, soid.oid.name.c_str(), soid.snap.val, op.op, ceph_osd_op_name(op.op));
+      if (op.op == CEPH_OSD_OP_SPARSE_READ) {
+	dout(0) << __func__ << " sparse op_read " << soid << dendl;
+	dout(0) << __func__ << " extent.length " << op.extent.length << dendl;
+
+      }
       dout(1) << "unrecognized osd op " << op.op
 	      << " " << ceph_osd_op_name(op.op)
 	      << dendl;

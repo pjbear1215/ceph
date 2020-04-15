@@ -496,6 +496,12 @@ public:
      uint32_t op_flags,
      int sd_index) {return 0;}
 
+   virtual int thinstore_stat(
+     CollectionHandle &c,
+     const ghobject_t& oid,
+     uint64_t & size,
+     int sd_index) {return 0;}
+
   /**
    * fiemap -- get extent std::map of data of an object
    *

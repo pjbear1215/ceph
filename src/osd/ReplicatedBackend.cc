@@ -261,6 +261,23 @@ int ReplicatedBackend::objects_read_sync(
   return store->read(ch, ghobject_t(hoid), off, len, *bl, op_flags);
 }
 
+int ReplicatedBackend::thinstore_stat(
+  const hobject_t &hoid,
+  uint64_t &size,
+  int sd_index)
+{
+  if (cct->_conf->thinstore_enable) {
+    ObjectStore * ostore = get_parent()->get_thinstore();
+    assert(ostore);
+    //dout(0) << __func__ << " stat " << hoid << dendl;
+    uint64_t size;
+    int result = ostore->thinstore_stat(ch, 
+	    ghobject_t(hoid), size, sd_index);
+    return result;
+  }
+  return -1;
+}
+
 int ReplicatedBackend::objects_read_sync(
   const hobject_t &hoid,
   uint64_t off,
@@ -272,7 +289,6 @@ int ReplicatedBackend::objects_read_sync(
   if (is_sr_request(hoid) && cct->_conf->thinstore_enable) {
     ObjectStore * ostore = get_parent()->get_thinstore();
     assert(ostore);
-    dout(0) << __func__ << " correct version " << hoid << dendl;
     return ostore->read(ch, ghobject_t(hoid), off, len, *bl, op_flags, sd_index);
   }
   return store->read(ch, ghobject_t(hoid), off, len, *bl, op_flags);
@@ -1468,8 +1484,10 @@ void ReplicatedBackend::do_repop(OpRequestRef op)
   if (op->get_req()->get_data().length() >= 4096 &&
       cct->_conf->osd_selective_dispatch_enable &&
       is_sr_request(soid)) {
-    is_sd = true;
-    op->is_sr_op = true;
+    if (!cct->_conf->sd_use_original_backend) {
+      is_sd = true;
+      op->is_sr_op = true;
+    }
   }
 #if 0
   dout(0) << __func__ << " is_sd " << is_sd 

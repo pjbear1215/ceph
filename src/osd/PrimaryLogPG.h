@@ -1552,6 +1552,8 @@ public:
   int fast_fast_do_osd_ops(const hobject_t &soid, vector<OSDOp>& ops, 
 			  ObjectStore::Transaction *op_t, OpRequestRef orig_op,
 			  int sd_index = -1);
+  bool is_large_osd_ops(const hobject_t& soid, vector<OSDOp>& ops);
+  bool is_write_osd_ops(vector<OSDOp>& ops);
 
   void record_write_error(OpRequestRef op, const hobject_t &soid,
 			  MOSDOpReply *orig_reply, int r);

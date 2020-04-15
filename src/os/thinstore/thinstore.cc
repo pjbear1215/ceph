@@ -303,6 +303,11 @@ int ThinStore::_write(ThTransContext *txc,
   dout(30) << __func__ << " " <<  o->oid
 	   << " 0x" << std::hex << offset << "~" << length << std::dec
 	   << dendl;
+#if 0
+  dout(0) << __func__ << " " <<  o->oid
+	   << " 0x" << std::hex << offset << "~" << length 
+	   << " sd index " << sd_index << dendl;
+#endif
   int r = 0;
   if (offset + length >= OBJECT_MAX_SIZE) {
     r = -E2BIG;
@@ -549,6 +554,7 @@ void ThinStore::_txc_add_transaction(ThTransContext *txc, Transaction *t, int sd
 	uint64_t off = op->off;
 	if (o->thonode.size > off) {
 	  o->thonode.size = off;
+	  dout(0) << __func__ << " op truncate " << off << dendl;
 	}
       }
       break;
@@ -615,6 +621,8 @@ void ThinStore::_txc_add_transaction(ThTransContext *txc, Transaction *t, int sd
 #endif
 	  
 	  r = _write(txc, o, off, len, bl, fadvise_flags, thioc, sd_index);
+	  // need this if bl exists
+	  thioc->batch_io_index++;
 	}
 	assert(r >= 0);
       }
@@ -661,6 +669,32 @@ void ThinStore::write_thonode(ThOnodeRef o, int sd_index)
     ceph_assert(0);
   }
   return;
+}
+
+void ThinStore::set_new_thonode(ThOnodeRef o, const ghobject_t& oid, int sd_index)
+{
+  // find location
+  uint32_t location = get_thmeta_location(o, sd_index);
+  uint64_t m_start_offset = part_desc[sd_index].m_start;
+  // ToDo: the read depending on the block size
+#if 0
+  dout(30) << __func__ << " start_offset " << m_start_offset << " location "
+	  << location << " sd_index " << sd_index  
+	  << " block size " << block_size 
+	  << " entry size " << part_desc[sd_index].m_desc.entry_size
+	  << dendl;
+#endif
+
+  // ToDo multiple block map
+  if (!o->thonode.block_maps) {
+    o->thonode.block_maps = new ThMetaBlockMap(block_size);
+  }
+  o->thonode.aligned_size = part_desc[sd_index].m_desc.entry_size;
+  o->thonode.cached = true;
+  o->thonode.need_flush_block_map = true;
+  o->thonode.block_size = block_size;
+  o->thonode.has_block_map = true;
+  o->thonode.oid = oid.hobj;
 }
 
 void ThinStore::read_thonode(ThOnodeRef o, const ghobject_t& oid, int sd_index)
@@ -822,7 +856,38 @@ ThOnodeRef ThinStore::get_thonode(
   assert(t);
   o.reset(t);
   thonode_map[sd_index]->insert( make_pair(oid.hobj, o) ); //= o;
-  read_thonode(o, oid, sd_index);
+  // ToDo: unconfliced thonode
+  //read_thonode(o, oid, sd_index);
+  set_new_thonode(o, oid, sd_index);
+
+  return o;
+}
+
+ThOnodeRef ThinStore::get_thonode_cache(
+  const ghobject_t& oid,
+  bool create,
+  int sd_index) 
+{
+  ceph_assert(thonode_map.size());
+  //ceph::unordered_map<ghobject_t, ThOnodeRef>::iterator p  = thonode_map[sd_index].find(oid);
+  ceph::unordered_map<hobject_t, ThOnodeRef>::iterator p; // = thonode_map[sd_index].find(oid);
+  bool found = false;
+  if (!thonode_map[sd_index]->empty()) {
+    p = thonode_map[sd_index]->find(oid.hobj);
+    if (thonode_map[sd_index]->end() != p) {
+      found = true;
+    }
+  }
+  ThOnodeRef o = NULL;
+  //if (thonode_map[sd_index].end() != p) {
+  if (found) {
+    o = p->second;
+    if (o) {
+      return o;
+    } else {
+      ceph_assert(0 == "this shouldn't be null");
+    }
+  }
 
   return o;
 }
@@ -1168,12 +1233,13 @@ int ThinStore::queue_transactions_in_place(
 	_txc_add_transaction(&txc, &(*p), op->sd_index, thioc);
       } else {
 	_txc_add_transaction(&txc, &(*p), op->sd_index, thioc);
-	thioc->batch_io_index++;
+	//thioc->batch_io_index++;
       }
     }
   }
 
-  ceph_assert(ops_list.size() == thioc->batch_io_index);
+  // probably be different due to truncate
+  //ceph_assert(ops_list.size() == thioc->batch_io_index);
 
   // ToDo: Except OP_WRITE, what operations is to be handled?
   // ceph_assert(thioc->has_pending_aios());
@@ -1187,7 +1253,7 @@ int ThinStore::queue_transactions_in_place(
 	      << dendl;
 #endif
       _do_raw_write(thioc->batch_direct_bl_offset[i], 
-		    thioc->batch_direct_bl[i].length(),
+		    thioc->batch_direct_bl_length[i],
 		    0, thioc->batch_direct_bl[i], sd_index, thioc);
     }
 
@@ -1390,7 +1456,6 @@ int ThinStore::_do_write(ThOnodeRef& o, uint64_t offset, size_t length, bufferli
       }
     }
 
-
     if (start_addr == 0) {
       vector<uint32_t> block_no = 
 	    (alloc[sd_index])->alloc_data_block(total_block_len, sd_index);
@@ -1431,9 +1496,20 @@ int ThinStore::_do_write(ThOnodeRef& o, uint64_t offset, size_t length, bufferli
 	o->thonode.size = get_addr_from_block(block_start) + get_addr_from_block(allocated_block);
       }
     } 
+#if 0
+else if (offset + length <= 4*1024*1024 && start_addr != 0) {
+      // truncate case
+      dout(0) << __func__ << " trunccated block " << dendl;
+      if ( (o->thonode.size < offset+length)) {
+	o->thonode.size = offset + length;
+      } else if ((o->thonode.size < 
+	  get_addr_from_block(block_start) + get_addr_from_block(total_block_len)) ) {
+	o->thonode.size = get_addr_from_block(block_start) + get_addr_from_block(total_block_len);
+      }
+    }
+#endif
 
     // block is already allocated, but thonode.size is smaller than allocation size
-
   } else {
     for (uint32_t i = block_start; i < block_start + total_block_len; i++) {
     bool get_addr_result;
@@ -1496,6 +1572,8 @@ int ThinStore::_do_write(ThOnodeRef& o, uint64_t offset, size_t length, bufferli
   bufferlist unaligned_buf;
   if (n_head || n_tail) {
     dout(0) << __func__ << " warning unaligned write " << dendl;
+    dout(0) << __func__ << " warning unaligned write " << dendl;
+    dout(0) << __func__ << " warning unaligned write " << dendl;
     uint64_t align_start_addr =
 	     o->thonode.block_maps->get_addr_by_offset(offset, get_addr_result);
     bdev->read(align_start_addr,
@@ -1525,10 +1603,12 @@ int ThinStore::_do_write(ThOnodeRef& o, uint64_t offset, size_t length, bufferli
       //thioc->batch_io_obj.push_back(o->oid);
       thioc->batch_direct_bl.push_back(bl);
       thioc->batch_direct_bl_offset.push_back(d_start_offset);
+      thioc->batch_direct_bl_length.push_back(length);
     } else {
       thioc->batch_io_obj.push_back(o->oid);
       thioc->batch_direct_bl.push_back(unaligned_buf);
       thioc->batch_direct_bl_offset.push_back(d_start_offset);
+      thioc->batch_direct_bl_length.push_back(length);
     }
   }
 
@@ -1561,6 +1641,16 @@ int ThinStore::_do_write(ThOnodeRef& o, uint64_t offset, size_t length, bufferli
 #endif
 
   }
+#if 0
+    dout(0) << __func__ << " start === " << " oid " << o->oid <<  " n_head " 
+	    << n_head << " n_body " << n_body << " n_tail " << n_tail 
+	    << " bl.length " << bl.length() << " block size " << block_size 
+	    << " length " << length << " sd_index " 
+	    << sd_index << " offset " << offset << " reamin_off " << remain_off
+	    << " allocateed_block " << allocated_block << " total block len " 
+	    << total_block_len << " thonode size " << o->thonode.size 
+	    << " d_start_offset " << d_start_offset << dendl;
+#endif
 
   // journal write
 #if 0
@@ -1601,6 +1691,11 @@ void ThinStore::_do_raw_write(uint64_t offset, uint64_t length, uint64_t bl_offs
 	    << " bl_offset " << bl_offset << dendl;
     ceph_assert(0);
   }
+  if (bl.length() != length) {
+    dout(0) << __func__ << " offset " << offset << " length " << bl.length() 
+	    << " bl_offset " << bl_offset << dendl;
+    ceph_assert(0);
+  }
   if (enable_async_write) {
     int r = bdev->aio_write(offset, bl, thioc, false, 0);
     if (r < 0) {
@@ -1614,6 +1709,21 @@ void ThinStore::_do_raw_write(uint64_t offset, uint64_t length, uint64_t bl_offs
       assert(0);
     }
   }
+}
+
+int ThinStore::read(
+  CollectionHandle &c_,
+  const ghobject_t& oid,
+  uint64_t &size,
+  int sd_index)
+{
+  ThOnodeRef o = get_thonode_cache(oid, false, sd_index);
+  if (!o || !(o->thonode.block_maps)) {
+    dout(0) << __func__ << " invalid or no blocks " << oid << dendl;
+    return -ENOENT;
+  }
+  size = o->thonode.size;
+  return 0;
 }
 
 // make new interfaces (queue_transaction, read)
@@ -1630,12 +1740,17 @@ int ThinStore::read(
   dout(30) << __func__ << " thinstore == " <<  oid
 	   << " 0x" << std::hex << offset << "~" << length << std::dec
 	   << " sd_index " << sd_index << dendl;
-  ThOnodeRef o = get_thonode(oid, false, sd_index);
+  dout(0) << __func__ << " thinstore == " <<  oid
+	   << " 0x" << std::hex << offset << "~" << length 
+	   << " sd_index " << sd_index << dendl;
+  //ThOnodeRef o = get_thonode(oid, false, sd_index);
+  ThOnodeRef o = get_thonode_cache(oid, false, sd_index);
   if (!o || !(o->thonode.block_maps)) {
-    dout(0) << __func__ << " invalid or no blocks " << dendl;
+    dout(0) << __func__ << " invalid or no blocks " << oid << dendl;
     return -ENOENT;
   }
   if (!o->thonode.size) {
+    dout(0) << __func__ << " size is zero?  " << oid << dendl;
     return -ENOENT;
   }
   // ToDo: Multiple blocks read
@@ -1658,6 +1773,8 @@ int ThinStore::read(
       cur_offset = offset - (block_size - remain);
     }
   }
+
+  dout(0) << __func__ << " start_addr " << start_addr << dendl;
 
   // read until continous offset
   while (cur_offset < offset + length) {
@@ -1753,7 +1870,7 @@ int ThinStore::read(
   bl.push_back(std::move(bptr));
   bl.copy_in(0, real_length, buffer.c_str() + remain);
 
-  dout(40) << __func__ << " remain " << remain << " try to read length " << length
+  dout(0) << __func__ << " remain " << remain << " try to read length " << length
 	  << " buffer length " << buffer.length() << " bl length " << bl.length() 
 	  << " real length " << real_length << " obj size " << o->thonode.size
 	  << dendl; 

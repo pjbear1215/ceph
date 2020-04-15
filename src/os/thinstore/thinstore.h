@@ -198,6 +198,11 @@ class ThinStore : public ObjectStore {
 		      bufferlist& bl, uint32_t sd_index, ThIOContext *thioc);
   int _do_meta_write(ThOnodeRef& o, int sd_index, ThIOContext *thioc);
   uint32_t get_thmeta_location(ThOnodeRef& o, int sd_index);
+  int read(
+    CollectionHandle &c_,
+    const ghobject_t& oid,
+    uint64_t &size,
+    int sd_index);
   int read(CollectionHandle &c_, const ghobject_t& oid, uint64_t offset,
 	  size_t length, bufferlist& bl, uint32_t op_flags) { return -EOPNOTSUPP; }
   int read(CollectionHandle &c_, const ghobject_t& oid, uint64_t offset,
@@ -219,6 +224,11 @@ class ThinStore : public ObjectStore {
     const ghobject_t& oid,
     bool create,
     int sd_index);
+  ThOnodeRef get_thonode_cache(
+    const ghobject_t& oid,
+    bool create,
+    int sd_index);
+  void set_new_thonode(ThOnodeRef o, const ghobject_t& oid, int sd_index);
   bool is_new_thonode(ThOnodeRef o);
   void write_thonode(ThOnodeRef o, int sd_index);
   void _journal_write(ThOnodeRef o, ThIOContext * thioc, bufferlist &bl, ThTransContext * txc);

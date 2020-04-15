@@ -611,6 +611,11 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
      bufferlist *bl,
      int sd_index) { return 0; }
 
+   virtual int thinstore_stat(
+     const hobject_t &hoid,
+     uint64_t &size,
+     int sd_index) { return 0; }
+
    virtual void objects_read_async(
      const hobject_t &hoid,
      const list<pair<boost::tuple<uint64_t, uint64_t, uint32_t>,

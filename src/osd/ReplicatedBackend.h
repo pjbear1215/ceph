@@ -434,6 +434,10 @@ public:
     //ceph_tid_t tid,
     osd_reqid_t reqid,
     OpRequestRef orig_op) override;
+  int thinstore_stat(
+    const hobject_t &hoid,
+    uint64_t &size,
+    int sd_index) override;
 
     // selective dispatch
     queue<sd_entry*> sd_entries;

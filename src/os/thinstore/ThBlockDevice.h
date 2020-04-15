@@ -97,6 +97,7 @@ public:
   std::vector<bufferlist> batch_direct_bl;
   std::vector<ghobject_t> batch_io_obj;
   std::vector<uint64_t> batch_direct_bl_offset;
+  std::vector<uint64_t> batch_direct_bl_length;
   struct ThSegment seg;
 
   explicit ThIOContext(CephContext* cct, void *p, bool allow_eio = false)
