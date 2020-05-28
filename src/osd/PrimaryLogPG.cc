@@ -2596,7 +2596,7 @@ int PrimaryLogPG::do_manifest_flush(OpRequestRef op, ObjectContextRef obc, Flush
 	}
       }();
       bufferlist in;
-      if (fp_oid != tgt_soid.oid) {
+      if (fp_oid != tgt_soid.oid && (!obc->ssc && !obc->ssc->snapset.clones.size())) {
 	// TODO: don't retain reference to dirty extents
 	// decrement old chunk's reference count
 	ObjectOperation dec_op;
@@ -3480,6 +3480,95 @@ void PrimaryLogPG::dec_refcount_non_intersection(ObjectContextRef obc, const obj
 			SnapContext(), refcount_t::DECREMENT_REF, NULL);
     }
   }
+}
+
+/**
+ * find_intersection_refs
+ *
+ * Returns the set offsets to references common (offset, length, and target match).
+ * 
+ *
+ * @param map [in] snapid_t which indicates the lower bound to compare source
+ * @param map [in] snapid_t which indicates the upper bound to compare source
+ * @param map [in] object_info_t which is a source to compare the intersection
+ * @param map [in] bool which represents whether l and g are adjacent
+ * @return common offsets from l to g
+ */
+
+std::optional<set<uint64_t>> PrimaryLogPG::find_intersection_refs(const std::optional<snapid_t>& l, 
+								  const std::optional<snapid_t>& g, 
+								  object_info_t& src, bool adjacent)
+{
+  set<uint64_t> refs;
+  hobject_t head_oid = src.soid.get_head();
+  ObjectContextRef head_obc = get_object_context(head_oid, false);
+  if (!head_obc) {
+    dout(0) << __func__ << ": Can not find head obc " << head_oid << dendl;;
+    return std::nullopt;
+  }
+  auto clone_iter = head_obc->ssc->snapset.clones.begin();
+  object_info_t* l_oi = NULL, * g_oi = NULL, * coi = NULL;
+  if (l) {
+    clone_iter = std::find(head_obc->ssc->snapset.clones.begin(), 
+			   head_obc->ssc->snapset.clones.end(), l);
+    if (clone_iter == head_obc->ssc->snapset.clones.end()) {
+      return std::nullopt;
+    }
+  } 
+  
+  dout(20) << __func__ << " l: " << l << " <= compare: " << *clone_iter << " <= g: " << g << dendl;
+
+  // l <= clones <= g
+  for (;clone_iter != head_obc->ssc->snapset.clones.end() && 
+       *clone_iter <= g; ++clone_iter) {
+    if (*clone_iter == src.soid.snap) {
+      continue;
+    }
+    hobject_t clone_oid = src.soid;
+    clone_oid.snap = *clone_iter;
+    ObjectContextRef cobc = get_object_context(clone_oid, false, NULL);
+    if (!cobc) {
+      break;
+    }
+    coi = &cobc->obs.oi;
+    src.manifest.build_intersection_set(coi->manifest.chunk_map, refs);
+    if (!l_oi) {
+      l_oi = coi;
+    }
+  }
+  g_oi = coi;
+
+  // head
+  if (!g || g == CEPH_NOSNAP) {
+    object_info_t &oi = head_obc->obs.oi;
+    if (oi.has_manifest()) {
+      src.manifest.build_intersection_set(oi.manifest.chunk_map, refs);
+    }
+    g_oi = &oi;
+  }
+
+  // check if there are duplicate refs between l and g
+  if (l != src.soid.snap && g != src.soid.snap && adjacent) {
+    set<uint64_t> dup_refs;
+    ceph_assert(l_oi);
+    l_oi->manifest.build_intersection_set(g_oi->manifest.chunk_map, dup_refs);
+    if (!dup_refs.empty()) {
+      for (auto p : dup_refs) {
+	hobject_t target_oid = l_oi->manifest.chunk_map[p].oid;
+	auto t = src.manifest.chunk_map.find(p);
+	
+	if (t == src.manifest.chunk_map.end() || 
+	    (t != src.manifest.chunk_map.end() ||
+	    target_oid != src.manifest.chunk_map[p].oid)) {
+	  object_locator_t target_oloc(target_oid);
+	  refcount_manifest(head_obc, head_oid, target_oloc, target_oid, 
+			    SnapContext(), refcount_t::DECREMENT_REF, NULL);
+	}
+      }
+    }
+  }
+
+  return refs;
 }
 
 void PrimaryLogPG::dec_all_refcount_head_manifest(object_info_t& oi, OpContext* ctx)
@@ -4532,34 +4621,30 @@ int PrimaryLogPG::trim_object(
     if (coi.is_cache_pinned())
       ctx->delta_stats.num_objects_pinned--;
     if (coi.has_manifest()) {
-      set<uint64_t> refs;
-      object_info_t oi;
-      for (auto p : snapset.clones) {
-	hobject_t clone_oid = coid;
-	if (clone_oid.snap == p) {
-	  continue;
-	}
-	clone_oid.snap = p;
-	ObjectContextRef cobc = get_object_context(clone_oid, false, NULL);
-	if (!cobc) {
-	  close_op_ctx(ctx.release());
-	  dout(0) << __func__ << ": Can not find obc " << coid << dendl;;
-	  return -ENOENT;
-	}
-
-	// check if the references is still used
-	oi = cobc->obs.oi;
-	if (oi.has_manifest()) {
-	  coi.manifest.build_intersection_set(oi.manifest.chunk_map, refs);
-	}
+      std::optional <set<uint64_t>> refs;
+      ObjectContextRef cobc = get_object_context(coid, false, NULL);
+      if (!cobc) {
+	close_op_ctx(ctx.release());
+	dout(0) << __func__ << ": Can not find obc " << coid << dendl;;
+	return -ENOENT;
       }
-      // head
-      oi = head_obc->obs.oi;
-      if (oi.has_manifest()) {
-	coi.manifest.build_intersection_set(oi.manifest.chunk_map, refs);
-      }
+      // adjacent clones
+      auto s = std::find(snapset.clones.begin(), snapset.clones.end(), coid.snap);
+      int index = std::distance(snapset.clones.begin(), s);
+      snapid_t l = *snapset.clones.begin(), g = CEPH_NOSNAP;
 
-      dec_refcount_non_intersection(head_obc, coi, refs);
+      if (index) {
+	l = snapset.clones[index - 1];
+      }
+      if (*s != snapset.clones.back()) {
+	g = snapset.clones[index + 1];
+      }
+      
+      refs = find_intersection_refs(l, g, cobc->obs.oi, true);
+
+      if (refs) {
+	dec_refcount_non_intersection(head_obc, coi, *refs);
+      }
       ctx->delta_stats.num_objects_manifest--;
     }
     obc->obs.exists = false;

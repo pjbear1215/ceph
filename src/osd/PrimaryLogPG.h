@@ -1506,6 +1506,9 @@ protected:
   void dec_all_refcount_head_manifest(object_info_t& oi, OpContext* ctx);
   void dec_refcount_non_intersection(ObjectContextRef obc, const object_info_t& oi, 
 				     const set<uint64_t>& intersection_set);
+  std::optional<set<uint64_t>> find_intersection_refs(const std::optional<snapid_t>& l, 
+						      const std::optional<snapid_t>& g, object_info_t& src,
+						      bool adjacent);
 
   friend struct C_ProxyChunkRead;
   friend class PromoteManifestCallback;
