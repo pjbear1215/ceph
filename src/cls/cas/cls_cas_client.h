@@ -10,7 +10,7 @@
 
 void cls_chunk_refcount_get(librados::ObjectWriteOperation& op,const hobject_t& soid);
 void cls_chunk_refcount_put(librados::ObjectWriteOperation& op, const hobject_t& soid);
-void cls_chunk_refcount_set(librados::ObjectWriteOperation& op, std::set<hobject_t>& refs);
-int cls_chunk_refcount_read(librados::IoCtx& io_ctx, std::string& oid, std::set<hobject_t> *refs);
+void cls_chunk_refcount_set(librados::ObjectWriteOperation& op, std::vector<hobject_t>& refs);
+int cls_chunk_refcount_read(librados::IoCtx& io_ctx, std::string& oid, std::vector<hobject_t> *refs);
 int cls_chunk_has_chunk(librados::IoCtx& io_ctx, std::string& oid, std::string& fp_oid);
 #endif

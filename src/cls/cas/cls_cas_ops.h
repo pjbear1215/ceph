@@ -53,7 +53,7 @@ struct cls_chunk_refcount_put_op {
 WRITE_CLASS_ENCODER(cls_chunk_refcount_put_op)
 
 struct cls_chunk_refcount_set_op {
-  std::set<hobject_t> refs;
+  std::vector<hobject_t> refs;
 
   cls_chunk_refcount_set_op() {}
 
@@ -75,7 +75,8 @@ struct cls_chunk_refcount_set_op {
 WRITE_CLASS_ENCODER(cls_chunk_refcount_set_op)
 
 struct cls_chunk_refcount_read_ret {
-  std::set<hobject_t> refs;
+  //std::set<hobject_t> refs;
+  std::vector<hobject_t> refs;
 
   cls_chunk_refcount_read_ret() {}
 
@@ -97,7 +98,7 @@ struct cls_chunk_refcount_read_ret {
 WRITE_CLASS_ENCODER(cls_chunk_refcount_read_ret)
 
 struct chunk_obj_refcount {
-  std::set<hobject_t> refs;
+  std::vector<hobject_t> refs;
 
   chunk_obj_refcount() {}
 

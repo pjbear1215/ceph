@@ -500,8 +500,8 @@ void ChunkScrub::chunk_scrub_common()
 	return;
       }
       auto oid = i.oid;
-      set<hobject_t> refs;
-      set<hobject_t> real_refs;
+      vector<hobject_t> refs;
+      vector<hobject_t> real_refs;
       ret = cls_chunk_refcount_read(chunk_io_ctx, oid, &refs);
       if (ret < 0) {
 	continue;
@@ -519,7 +519,7 @@ void ChunkScrub::chunk_scrub_common()
 
 	ret = cls_chunk_has_chunk(target_io_ctx, pp.oid.name, oid);
 	if (ret != -ENOENT) {
-	  real_refs.insert(pp);
+	  real_refs.push_back(pp);
 	} 
       }
 
@@ -860,7 +860,7 @@ int chunk_scrub_common(const std::map < std::string, std::string > &opts,
       usage_exit();
     }
 
-    set<hobject_t> refs;
+    vector<hobject_t> refs;
     ret = cls_chunk_refcount_read(chunk_io_ctx, object_name, &refs);
     if (ret < 0) {
       cerr << " cls_chunk_refcount_read fail : " << cpp_strerror(ret) << std::endl;
@@ -876,7 +876,7 @@ int chunk_scrub_common(const std::map < std::string, std::string > &opts,
       return ret;
     }
     hobject_t oid(sobject_t(target_object_name, CEPH_NOSNAP), "", hash, pool_id, "");
-    refs.insert(oid);
+    refs.push_back(oid);
 
     ObjectWriteOperation op;
     cls_chunk_refcount_set(op, refs);
@@ -894,7 +894,7 @@ int chunk_scrub_common(const std::map < std::string, std::string > &opts,
     } else {
       usage_exit();
     }
-    set<hobject_t> refs;
+    vector<hobject_t> refs;
     cout << " refs: " << std::endl;
     ret = cls_chunk_refcount_read(chunk_io_ctx, object_name, &refs);
     for (auto p : refs) {

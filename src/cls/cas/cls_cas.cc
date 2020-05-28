@@ -71,7 +71,7 @@ static int cls_rc_chunk_refcount_get(cls_method_context_t hctx, bufferlist *in, 
 
   CLS_LOG(10, "cls_rc_chunk_refcount_get() oid=%s\n", op.source.oid.name.c_str());
 
-  objr.refs.insert(op.source);
+  objr.refs.push_back(op.source);
 
   ret = chunk_set_refcount(hctx, objr);
   if (ret < 0)
@@ -116,8 +116,9 @@ static int cls_rc_chunk_refcount_put(cls_method_context_t hctx, bufferlist *in, 
     return 0;
   }
 
-  auto p = objr.refs.find(op.source);
-  objr.refs.erase(p);
+  auto p = std::find(objr.refs.begin(), objr.refs.end(), op.source);
+  if (p != objr.refs.end())
+    objr.refs.erase(p);
 
   if (objr.refs.empty()) {
     return cls_cxx_remove(hctx);
@@ -147,7 +148,9 @@ static int cls_rc_chunk_refcount_set(cls_method_context_t hctx, bufferlist *in, 
   }
 
   chunk_obj_refcount objr;
-  objr.refs = op.refs;
+  for (auto p : op.refs) {
+    objr.refs.push_back(p);
+  }
 
   int ret = chunk_set_refcount(hctx, objr);
   if (ret < 0)
@@ -166,7 +169,7 @@ static int cls_rc_chunk_refcount_read(cls_method_context_t hctx, bufferlist *in,
     return ret;
 
   for (auto &p : objr.refs) {
-    read_ret.refs.insert(p);
+    read_ret.refs.push_back(p);
   }
 
   encode(read_ret, *out);
@@ -195,7 +198,7 @@ static int cls_rc_write_or_get(cls_method_context_t hctx, bufferlist *in, buffer
   chunk_obj_refcount objr;
   int ret = chunk_read_refcount(hctx, &objr);
   if (ret == -ENOENT) {
-    objr.refs.insert(src_obj);
+    objr.refs.push_back(src_obj);
     bufferlist set_bl;
     encode(objr, set_bl);
     ret = cls_cxx_chunk_write_and_set(hctx, op.extent.offset, op.extent.length, &indata, op.flags,
@@ -206,7 +209,7 @@ static int cls_rc_write_or_get(cls_method_context_t hctx, bufferlist *in, buffer
     return 0;
   }
 
-  objr.refs.insert(src_obj);
+  objr.refs.push_back(src_obj);
   ret = chunk_set_refcount(hctx, objr);
   if (ret < 0)
     return ret;
