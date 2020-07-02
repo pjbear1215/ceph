@@ -5786,6 +5786,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
     case CEPH_OSD_OP_CACHE_PIN:
     case CEPH_OSD_OP_CACHE_UNPIN:
     case CEPH_OSD_OP_SET_REDIRECT:
+    case CEPH_OSD_OP_SET_CHUNK:
     case CEPH_OSD_OP_TIER_PROMOTE:
     case CEPH_OSD_OP_TIER_FLUSH:
       break;
@@ -6958,6 +6959,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  if (!has_reference && need_reference) {
 	    oi.set_flag(object_info_t::FLAG_REDIRECT_HAS_REFERENCE);
 	  }
+	  ctx->set_manifest = true;
 	  dout(10) << "set-redirect oid:" << oi.soid << " user_version: " << oi.user_version << dendl;
 	  if (op_finisher) {
 	    ctx->op_finishers.erase(ctx->current_osd_subop_num);
@@ -6983,10 +6985,9 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  result = -EOPNOTSUPP;
 	  break;
 	}
-	if (ctx->snapc.snaps.size() || 
-	    (ctx->obc->ssc && ctx->obc->ssc->snapset.clones.size()) ) {
-	  result = -EOPNOTSUPP;
-	  break;
+	if (oi.manifest.is_redirect()) {
+	  result = -EINVAL;
+	  goto fail;
 	}
 
 	object_locator_t tgt_oloc;
@@ -7019,10 +7020,6 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  }
 	}
 
-        if (!oi.manifest.is_chunked()) {
-          oi.manifest.clear();
-        }
-
 	pg_t raw_pg;
 	chunk_info_t chunk_info;
 	get_osdmap()->object_locator_to_pg(tgt_name, tgt_oloc, raw_pg);
@@ -7052,7 +7049,9 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  }
 
 	  chunk_info_t chunk_info;
-	  chunk_info.set_flag(chunk_info_t::FLAG_MISSING);
+	  if (src_offset + src_length > oi.size) {
+	    chunk_info.set_flag(chunk_info_t::FLAG_MISSING);
+	  }
 	  chunk_info.oid = target;
 	  chunk_info.offset = tgt_offset;
 	  chunk_info.length = src_length;
@@ -7068,6 +7067,7 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	    oi.manifest.chunk_map[src_offset].set_flag(chunk_info_t::FLAG_HAS_FINGERPRINT);
 	  }
 	  ctx->modify = true;
+	  ctx->set_manifest = true;
 
 	  dout(10) << "set-chunked oid:" << oi.soid << " user_version: " << oi.user_version 
 		   << " chunk_info: " << chunk_info << dendl;
@@ -8226,6 +8226,7 @@ void PrimaryLogPG::make_writeable(OpContext *ctx)
   if ((ctx->obs->exists && !ctx->obs->oi.is_whiteout()) && // head exist(ed)
       snapc.snaps.size() &&                 // there are snaps
       !ctx->cache_evict &&
+      !ctx->set_manifest &&
       snapc.snaps[0] > ctx->new_snapset.seq) {  // existing object is old
     // clone
     hobject_t coid = soid;

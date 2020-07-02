@@ -698,6 +698,8 @@ public:
 
     std::map<int, std::unique_ptr<OpFinisher>> op_finishers;
 
+    bool set_manifest = false;
+
     OpContext(const OpContext& other);
     const OpContext& operator=(const OpContext& other);
 
