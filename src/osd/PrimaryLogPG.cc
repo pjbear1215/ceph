@@ -9847,6 +9847,13 @@ void PrimaryLogPG::finish_promote(int r, CopyResults *results,
   tctx->extra_reqids = results->reqids;
   tctx->extra_reqid_return_codes = results->reqid_return_codes;
 
+  if (obc->obs.oi.has_manifest() && obc->obs.oi.manifest.is_redirect()) {
+    tctx->new_obs.oi.manifest.type = 0;
+    tctx->new_obs.oi.clear_flag(object_info_t::FLAG_REDIRECT_HAS_REFERENCE);
+    tctx->new_obs.oi.clear_flag(object_info_t::FLAG_MANIFEST);
+    tctx->delta_stats.num_objects_manifest--;
+  }
+
   if (whiteout) {
     // create a whiteout
     tctx->op_t->create(soid);
