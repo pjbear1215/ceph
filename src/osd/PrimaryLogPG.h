@@ -1207,10 +1207,11 @@ protected:
   void reply_ctx(OpContext *ctx, int err);
   void make_writeable(OpContext *ctx);
   void log_op_stats(const OpRequest& op, uint64_t inb, uint64_t outb);
+  bool need_clone(OpContext *ctx);
 
   void write_update_size_and_usage(object_stat_sum_t& stats, object_info_t& oi,
 				   interval_set<uint64_t>& modified, uint64_t offset,
-				   uint64_t length, bool write_full=false);
+				   uint64_t length, bool write_full=false, OpContext *ctx=NULL);
   inline void truncate_update_size_and_usage(
     object_stat_sum_t& delta_stats,
     object_info_t& oi,
@@ -1505,6 +1506,7 @@ protected:
 			 RefCountCallback* cb);
   void dec_all_refcount_manifest(const object_info_t& oi, OpContext* ctx);
   void dec_refcount(ObjectContextRef obc, const object_ref_delta_t& refs);
+  bool is_dedup_chunk(const object_info_t& oi, const chunk_info_t& chunk);
 
   friend struct C_ProxyChunkRead;
   friend class PromoteManifestCallback;
