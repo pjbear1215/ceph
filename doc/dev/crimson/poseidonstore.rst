@@ -2,90 +2,61 @@
  PoseidonStore
 ===============
 
-Key concepts and goals
+Goals and Basics
 ======================
 
-* As one of the pluggable backend stores for Crimson, PoseidonStore targets only 
-  high-end NVMe SSDs (not conserned with ZNS devices).
-* Hybrid update strategies for difference data types (in-place, out-of-place) to
-  minimize CPU consumption by reducing host-side GC.
-* Utilize NVMe feature (atomic large write command)
-* Sharded data/processing model
-* Support transactions
+* Target only high-end NVMe devices with NVM (not concerned with ZNS devices)
+* Designed entirely for low CPU consumption
+    - Remove a black-box component like RocksDB and a file abstraction layer in BlueStore to avoid unnecessary overheads (e.g., data copy and serialization/deserialization)  
+    - Make use of *io_uring*, new kernel asynchronous I/O interface, to selectively use the interrupt driven mode for CPU efficiency (or polled mode for low latency)
+    - Hybrid update strategies for different data size (similar to BlueStore)
+        - in-place update for small I/O to minimize CPU consumption by reducing host-side GC
+        - out-of-place update for large I/O to eliminate double write
+* Use Seastar futures programming model for a sharded data/processing model
+
 
 Background
 ----------
+Both in-place and out-of-place update strategies have their pros and cons. 
 
-- Log-structured store 
-  This kind of store manages a log to store/read the data. Whenever the write is coming 
-  to the store, the data along with metadata is appended at the end of log. 
-  - Pros
-    - Without doubt, one sequential write is enough to store the data
-    - It natually supports transaction (this is no overwrite, so the store can rollback 
-      previous stable state)
-    - Flash friendly (Definately, it mitigates GC burden on SSDs)
-  - Cons
-    - There is host-side GC that induces overheads 
-      - I/O amplification (host-side)
-      - More host-CPU consumption
-    - Slow metadata lookup
-    - Space overhead (live and unused data co-exist)
+Log-structured based storage system is a typical example that adopts an update-out-of-place approach. It never modifies the written data. Writes always go to the end of the log. It enables I/O sequentializing.
 
-- In-place update store
-  Conventional filsystems such as ext4, xfs have in-place update manner. This type of 
-  the store overwrites data and metadta at fixed offset depending on a file.
+* Pros
+    - Higher random I/O performance for HDDs (and maybe for SSDs)
+    - It doesn't require WAL to support transaction due to the no-overwrite nature (no double write)
+    - Flash friendly (less GC activity for SSDs)
+* Cons
+    - It requires host-side GC that induces overheads
+        - I/O amplification (host-side)
+        - Host-CPU consumption
 
-  - Pros
-    - No host-side GC is required
-    - Fast lookup
-    - No space overhead
-  - Cons
-    - More write occurs to record the data (metadata and data section are separated)
-    - It cannot support transaction. WAL is required to support transactions
-    - Give more burdens on SSDs due to device-level GC
+The update-in-place strategy has been used widely for conventional file systems such as ext4 and xfs. Once a block has been placed in a given disk location, it doesn't move. Thus, writes go to the corresponding location in the disk.
+
+* Pros
+    - Less host-CPU consumption (leave GC entirely up to SSDs)
+* Cons
+    - WAL is required to support transaction (double write to prevent partial write)
+    - Flash unfriendly (more GC activity for SSDs)
+    
 
 Motivation
 ----------
 
-In modern distributed storage system, a server node can be equipped with multiple 
-NVMe storage devices. In fact, ten or more nodes could be attached on a server.
-As a result, CPU resouces to acheive NVMe SSDs's performance is much higher than before
-in terms of IOPS (I/O per seconds).
-To fully exploit NVMe's performance, now we should consider host-side overhead that 
-occurs due to high CPU consumption. In short, minimizing host-side CPU consumption
-caused by storage processing is crucial.
+In modern distributed storage systems, a server node can be equipped with multiple 
+NVMe storage devices. In fact, ten or more NVMe SSDs could be attached on a server.
+As a result, it is hard to achieve NVMe SSD's full performance due to the limited CPU resources 
+available in a server node. In such environments, CPU tends to become a performance bottleneck.
+Thus, now we should focus on minimizing host-CPU consumption, which is the same as the Crimson's objective.
 
-From the perspective of CPU consumption in the store-level, the way that mitigate
-resource usage is minimzing internel operation while processing I/O.
-Conventional log-based store has a benefit of flash friendly data layout. 
-However, Key-value DB based on LSM tree causes host-side I/O amplification 
-including compaction. In addition, Log-structured store also produces unpredictable
-I/O by garbage collection.
+Towards a object store highly optimized for CPU consumption, three design choices have been made.
 
-The ideal store would issues the same number of I/Os as requested by the user to the store 
-device without I/O amplification. However, it is impossible to store the data via
-only a single write because the store in Ceph requires supporting transaction which
-requires ACID. Therefore, we intent to minimize I/O amplification while supporing
-transaction by using hybrid update scheme depending data types.
+* **PoseidonStore does not have a black-box component like RocksDB in BlueStore.** Thus, it can avoid unnecessary data copy and serialization/deserialization overheads. Moreover, we can remove an unncessary file abstraction layer, which was required to run RocksDB. Object data and metadata is now directly mapped to the disk blocks (no more object-to-file mapping). Eliminating all these overheads will reduce CPU consumption.
 
+* **PoseidonStore makes use of io_uring, new kernel asynchronous I/O interface to exploit interrupt-driven I/O.** User-space driven I/O solutions like SPDK provide high I/O performance by avoiding syscalls and enabling zero-copy access from the application. However, it does not support interrupt-driven I/O, which is only possible with kernel-space driven I/O. Polling is good for low-latency but bad for CPU efficiency. On the other hand, interrupt is good for CPU efficiency and bad for low-latency (but not that bad as I/O size increases). Note that network acceleration solutions like DPDK also excessively consume CPU resources for polling. Using polling both for network and storage processing aggrevates CPU consumption. Since network is typically much faster and has a higher priority than storage, polling should be applied only to network processing.
 
-Keyidea
--------
+* **PoseidonStore uses hybrid update strategies for different data size, similar to BlueStore.** As we discussed, both in-place and out-of-place update strategies have their pros and cons. Since CPU is only bottlenecked under small I/O workloads, we chose update-in-place for small I/Os to miminize CPU consumption while choosing update-out-of-place for large I/O to avoid double write. Double write for small data may be better than host-GC overhead in terms of CPU consumption in the long run. Although it leaves GC entirely up to SSDs,
+high-end NVMe SSD has enuough powers to handle more works. Also, SSD lifespan is not a practical concern these days (there is enough program-earse cycle limit [1]). On the other hand, for large I/O workloads, the host can afford process host-GC. Also, the host can garbage collect invalid objects more effectively when their size is large.
 
-Out-of-place update scheme: | SB | Object metadata | Journal |
-In-place update scheme: | SB | Object metadata | Allocation bitmap | Data blocks |
-
-We are probably able to mitigate all the cons of the in-place update store 
-combining out-of-place benefit as follows
-- Use pre-allocation technique to reduce # of writes
-- Ordered-mode-like with hybrid update scheme utilizing NVMe feature + help from 
-  replica on recovery to minimize I/O amplification with supporting transaction
-- High-end NVMe SSD has enuough powers to handle more works
-- There is enough program-earse cycle limit [1]
-- Depening on data type, some data does not induce much overheads caused by GC
-
-Therefore, we propose PoseidonStore which makes use of different update strategy 
-to minimize CPU consumption and I/O amplification
 
 Observation
 -----------
