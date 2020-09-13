@@ -69,47 +69,44 @@ Three data types in Ceph
       data. Nevertheless, a constant number of operations would be better than out-of-place
       even if it aggravates WAF in SSDs
 - Metadta or small data (e.g., object_info_t, snapset, pg_log, and collection)
-  - Most metadata can be cached in memory because the object size is large (4MB)
   - Multiple small-sized metadta entries for an object
   - The best solution to store this data is WAL + Using cache
     - The efficient way to store metadata is to merge all metadata related to data
       and store it though a single write operation even though it requires background
       flush to update the data partition
 
+
 Design
 ======
 .. ditaa::
 
-  +-WAL partition-|----------------------Data partition-------------------------+
+  +-WAL partition-|----------------------Data partition---------------------------+
   | Sharded partition 1
-  +-----------------------------------------------------------------------------+
-  | WAL -> |      | Super block | Object meta | Allocation bitmap | Data blocks |
-  +-----------------------------------------------------------------------------+
+  +-------------------------------------------------------------------------------+
+  | WAL -> |      | Super block | Freelist info | Onode B+free info| Data blocks  |
+  +-------------------------------------------------------------------------------+
   | Sharded partition 2
-  +-----------------------------------------------------------------------------+
-  | WAL -> |      | Super block | Object meta | Allocation bitmap | Data blocks |
-  +-----------------------------------------------------------------------------+
+  +-------------------------------------------------------------------------------+
+  | WAL -> |      | Super block | Freelist info | Onode B+free info| Data blocks  |
+  +-------------------------------------------------------------------------------+
   | Sharded partition N 
-  +-----------------------------------------------------------------------------+
-  | WAL -> |      | Super block | Object meta | Allocation bitmap | Data blocks |
-  +-----------------------------------------------------------------------------+
+  +-------------------------------------------------------------------------------+
+  | WAL -> |      | Super block | Freelist info | Onode B+free info| Data blocks  |
+  +-------------------------------------------------------------------------------+
+  | Global information                                                           
+  +-------------------------------------------------------------------------------+
+  | Global WAL -> |                                                               |
+  +-------------------------------------------------------------------------------+
 
 
 - WAL
   - Log and frequently updated metadata are stored as a WAL entry in the WAL partition
-  (Can be placed on NVM)
   - Space within the WAL partition is continually reused in a circular manner
-  - Flush the metadata if necessary
-- Write procedure for Metadata
-  - Appended at the WAL first
-  - Overwrite the metadta in the data partition when flushing
-- Write procedure for Data
-  - Overwrite the data in the data partition
-  - Disk layout
-  - Object meta can embed data. For example, object_info_t can be recorded as an entry of
-    the Object meta
-  - Allocation bitmap manages the Data blocks
-  - Super block manages data partitions
+  - Flush the WAL entries if necessary
+- Disk layout
+  - Data blocks are metadata blocks or data blocks
+  - Freelist manages the Root of free space B+free
+  - Super block contains management info for a data partition
 
 
 I/O procedure
@@ -142,13 +139,18 @@ I/O procedure
       using NVMe atomic write command on the WAL
       - NVMe provides atomicity guarantees for a write command (Atomic Write Unit Power Fail)
         For example, 512 Kbytes of data can be atomically written at once without fsync()
-      - Small size (object_info_t, snapset, collection, etc.) can be embed
-            - stage 1
-        WAL (written) --> | TxBegin A | Log Entry | TxEnd A | (if small)
-        Data partition (written)--> | Data blocks | (if large)
-          - 2. Then, append the data to WAL (if large)
-      - stage 2 (Updating object meta and allocation bitmap can be skipped via pre-allocation)
-        WAL --> | TxBegin A | Log Entry | TxEnd A | (if large)
+      - Small size (object_info_t, snapset, etc.) can be embed
+      - stage 1
+        - if the data is small
+        WAL (written) --> | TxBegin A | Log Entry | TxEnd A | 
+        - if the data is large
+        Data partition (written) --> | Data blocks | 
+      - stage 2
+        - if the data is small
+        No need.
+        - if the data is large
+        Then, append the metadata to WAL.
+        WAL --> | TxBegin A | Log Entry | TxEnd A | 
 
 - Read
   - Use the cached object metadata to find out the data location
@@ -156,7 +158,12 @@ I/O procedure
     latest meta data
 
 - Flush
-  - Flush WAL entries whenever needed
+  - Flush WAL entries which have committed. There are two conditions
+    (1. the size of WAL is close to full, 2. a signal to flush).
+    We can mitigate the overhead of frequent flush via batching processing, but it leads to
+    delaying completion.
+
+
 
 
 Crash consistency
@@ -165,9 +172,9 @@ Large case
 - 1. Crash occurs right after writing Data blocks
   - Data partition --> | Data blocks |
   - We don't need to care this case. Data is not alloacted yet in reality. The blocks will be reused.
-- 2. Crash occurs right after WAL using atomic write command
-  - WAL --> | TxBegin A | Log Entry| TxEnd A |
+- 2. Crash occurs right after WAL 
   - Data partition --> | Data blocks |
+  - WAL --> | TxBegin A | Log Entry | TxEnd A |
   - Write procedure is completed, so there is no data loss or inconsistent state
 
 Small case
@@ -179,11 +186,13 @@ Small case
 Comparison
 ----------
 - Best case (pre-allocation)
-  - Only need two writes on both WAL and Data partition without updating Object meta and Data bitmap
-- Worst case (flush happens)
-  - Without embedding, at least three writes are required additionally on Object meta, Data bitmap, and Data blocks
-  - WAL needs to be flushed if the WAL is close to full and the WAL entry is snapset, object_info_t,
-    collection and pg_log
+  - Only need writes on both WAL and Data partition without updating object metadata (for the location).
+- Worst case 
+  - At least three writes are required additionally on WAL, object metadata, and data blocks.
+  - If the flush from WAL to the data parition occurs frequently, b+tree onode structure needs to be update
+    in many times. To minimize such overhead, 
+
+- WAL needs to be flushed if the WAL is close to full or a signal to flush.
   - The premise behind this design is OSD can manage the lateset metadta as a single copy. So,
     appended entires are not to be read
 - Either best of worst case does not produce severe I/O amplification (it produce I/Os, but I/O rate is constant) 
@@ -194,113 +203,106 @@ Detailed Design
 ===============
 
 - Onode lookup
- - Flat namespace
-  Object data, object meta, omap, and xattrs are all the data related to an object (we call it a head object from ghobject).
-  PoseidonStore adds different suffixes to the head object ID to create PSD_OID to distinguish them 
-  (e.g., Assuming head object ID = 12.e4 -> Object data's PSD_OID = 12.e4_data, Object meta's PSD_OID = 12.e4_meta, omap's 
-  PSD_OID = 12.e4_omap_key1, xattr's PSD_OID = 12.e4_xattr_key1).
-  By eliminating suffixes, we can recover their head object ID. Thus, we can know they are all related to the same object.
-  Note that because all objects are sorted by their PSD_OIDs in lexicographic order, xattrs and omap can be iterated
-  in lexicographic order. For object deletion, all the objects having the same head object ID are searched and deleted.
+  - Radix tree
+  Our design is based on the prefix tree. Ceph already makes use of the chracteristic of OID's prefix to split or search
+  the OID (e.g., pool id + hash + oid). So, the prefix tree fits well to store or search the object. Our scheme is designed 
+  to lookup the prefix tree efficiently.
 
-  A leafnode contains <OID, Block no, Offset, Extent>.
-  With the hash entry, we can find the disk location of the target object.
-  Since the Extent entry in the Block contains <OID, Chunk Number, (Offset, len), (Offset, len), … >, 
-  we can read the object.
+  - Sharded partition
+  A few bits at the begining of OID determine a shareded partition where the object is located.
+   +--------------------------+--------------------------+--------------------------+
+   | sharded partition 1 (00) | sharded partition 2 (01) | sharded partition 3 (10) |
+   +--------------------------+--------------------------+--------------------------+ 
 
- -Lookup
-  As described in the figure, we replaced hash table on Object meta with b+tree to find out items efficiently.
-  This is because we can control the tree based on the policy we define and it can do fast lookup.
-  There is no on-disk onode data structure. To fill the in-memory onode data structure, object meta, xattrs,
-  and omap of the target object can be retrieved using the respective PSD_OIDs.
-  Also, we use PSD_OID as a key to find the leaf node that contains extent.
-  Data type in leaf node indicates if the pointing data is inline data or an extent array of <start block num, block count>.
-  According to the data type, it reads the blocks needed for the object.
-  If you look at the figure as below, there is the leafnode which contains extent info. Using
-  extent info, we can know where the extent is located. Extent contains where data
-  chunks locate by using extent map, so we finally figure out the data location.
+  - Ondisk onode
+  stuct onode {
+    radix tree childs;
+    radix tree parent_node;
+    extent tree block_maps;
+    clone tree clones;
+    omap lists omaps;
+  }
+  onode contains the radix tree for lookup, which means we can search objects uinsg tree information in onode 
+  if we know the onode. Also, if the data size is small, the onode can embed the data.
+  The onode has fixed size. On the other hands, block_maps, clones have variable-length.
+   +---------------+------------+--------+-------+
+   | on-disk onode | block_maps | clones | omaps |
+   +---------------+------------+--------+-------+ 
+              |           ^        ^
+              |-----------|--------|
+
+  - Lookup
+  The location of the root of onode tree is specified on Onode B+tree info, so we can find out where the object 
+  is located by using the prefix tree. For example, shared partition is determined by OID as described above. 
+  Using rest of the OID's bits and radix tree, lookup procefure finds out the location of the onode.
+  The extent tree (block_maps) contains where data chunks locate by using extent map, so we finally figure out the data location.
 
 
 - Allocation
-Allocation Groups
-Entire disk space is divided into a number of equally sized chunks called Allocation Groups (AG).
-Each reactor thread in crimson-osd is responsible for a set of AGs (# of AGs / # of threads).
-Each AG has its own data structures to manage the disk partition.
+  - Sharded partitions
+  Entire disk space is divided into a number of equally sized chunks called sharded partition (SP).
+  Each SP has its own data structures to manage the disk partition.
 
-The freespace is tracked on a per-AG basis.
-The initial version of PoseidonStore will use bitmaps for the validity of all blocks in the AG.
-The bitmaps are pre-allocated in the allocation bitmap partition.
-Upon new object write, we allocate an extent of contiguous blocks large enough to fit data by referring to the allocation bitmaps.
-We may use two extent-based b+trees for efficient contiguous free space tracking; one by block number and another 
-by block count (similar to XFS).
-We leave this for future work. The means of free space tracking can be configured at the initial disk setup 
-(cannot be changed after configuration).
+  - Data allocation
+  As we explained above, the only management infos (e.g., super block, freelist info, onode b+tree info) are pre-allocated 
+  in each shared partition. Given OID, we can map any data to the extent tree in the node. 
+  Blocks can be allocated by searching the free space tracking data structure (we explain below).
 
-- Data allocation
-As we explained above, the entire hash table is pre-allocated in each AG. Given OID, we can map any data to 
-the segment and offset. Blocks can be allocated by searching the free space 
-tracking data structure (we explain below).
-Based on onode lookup, we probably know where OID is located via Block number. 
-
-- Free space tracking
-We can use either data block bitmap in EXT4 or extent-based B+tree in XFS for free space tracking.
-Our first prototype will be implemented based on the block bitmap for the sake of implementation.
-Regarding allocation bitmap, we have a plan to re-use the existing the design of bitmapfreelistmanager and bitmapallocator 
-in Bluestore (Underlying storage should be changed KV db to raw device)  
+  - Free space tracking
+  The freespace is tracked on a per-AG basis. We can use extent-based B+tree in XFS for free space tracking.
+  The freelist info contains the root of free space B+free.
 
 - Omap
-In this design (see below figure), omap is not different from data and onode. They all can be retrieved via hash table lookup
+In this design (see below figure), omap data is tracked by lists in onode. the onode only has the header of omap.
+The header contains entires which indicate where the name list and data list exist.
+So, if we know the onode, omap can be easliy found via omap lists.
 
 - Fragmentation
-Internal fragmentation
-We pack different type of data/metadata in a single block as many as possible to reduce internal fragmentation.
-Extent-based B+tree may help reduce this further by allocating contiguous blocks that best fit for the object
+  - Internal fragmentation
+  We pack different type of data/metadata in a single block as many as possible to reduce internal fragmentation.
+  Extent-based B+tree may help reduce this further by allocating contiguous blocks that best fit for the object
 
-External fragmentation
-Frequent object create/delete may lead to external fragmentation
-In this case, we need cleaning work (GC-like) to address this.
-For this, we are referring the NetApp’s Continuous Segment Cleaning, which seems similar to the SeaStore’s approach
-Countering Fragmentation in an Enterprise Storage System (NetApp, ACM TOS, 2020)
+  - External fragmentation
+  Frequent object create/delete may lead to external fragmentation
+  In this case, we need cleaning work (GC-like) to address this.
+  For this, we are referring the NetApp’s Continuous Segment Cleaning, which seems similar to the SeaStore’s approach
+  Countering Fragmentation in an Enterprise Storage System (NetApp, ACM TOS, 2020)
 
 .. ditaa::
 
 
-       +-------------+-------------------+-------------+
-       | Object meta | Allocation bitmap | Data blocks | --------------------------------
-       +----+--------+-------------------+------+------+               |                |
-            |                                                          |                | 
-            | OID                                                      |                | 
-            |                                                          |                |
-        +---+---+                                                      |                |
-        | Root  |                                                      |                |
-        +---+---+                                                      |                |
-            |                                                          |                |
-            v                 Tree                                     |                |
-       +---------+---------+---------+                                 |                |
-       | Subtree | ...     | Subtree |                                 v                |
-       +=========+=========+=========+                          +---------------+       |
-       | Header  | ...     | ...     |                          | OID           |<-----------------+
-       +---------+---------+---------+                          | Num Chunk     |       |          |
-    +--| Entry0  | ...     | ...     |                          | <Offset, len> |       |          |
-    |  +---------+---------+---------+                          | <Offset, len> |-------|----+     |
-    |  | ...     | ...     | ...     |                          | ...           |       |    |     |
-    |  +---------+---------+---------+                          +---------------+       |    |     |
-    |  | EntryK  | ...     | ...     |                                                  |    |     |
-    |  +---------+---------+---------+                                                  |    |     |
-    |                                                                                   |    |     |
-    |                                                                                   |    |     |
-    |  +---------------+  +----------+  +-------------+                                 v    v     |
-    +->| leafnode      |  | leafnode |  | leafnode    |               +------------+------------+  |
-       +===============+  +==========+  +=============+               | Block0     | Block1     |  |
-       | OID           |  | OID      |  | OID         |               +============+============+  |
-       | Block no      |  | Block no |  | Block no    |               | Free       |            |  |
-       | Offset        |  | Offset   |  | Offset      |               +------------+            +  |
-       | Extent        |  | Extent   |  | Extent      |----------+    | Small data | Data       |  |
-       +---------------+  +----------+  +-------------+          |    +------------+            +  |
-                                                                 +-+->| Extent     |            |  |
-                                                                      +------------+------------+  |
-                                                                          |                        |
-                                                                          +------------------------+
+       +---------------+-------------------+-------------+
+       | Freelist info | Onode B+tree info | Data blocks | ------|
+       +----+----------+-------------------+------+------+       |   
+            ---------------------|           |                   |   
+            |        OID                     |                   |     
+            |                                |                   |     
+        +---+---+                            |                   |     
+        | Root  | Radix tree                 |                   |     
+        +---+---+                            |                   |     
+            |                                |                   |     
+            v                                |                   |   
+       +---------+---------+---------+       |                   |     
+       | Subtree | ...     | Subtree |       |                   v     
+       +=========+=========+=========+       |      +---------------+       
+       | onode   | ...     | ...     |       |      |               |
+       +---------+---------+---------+       |      | Num Chunk     |        
+    +--| onode   | ...     | ...     |       |      | <Offset, len> |        
+    |  +---------+---------+---------+       |      | <Offset, len> |-------|
+    |                                        |      | ...           |       | 
+    |                                        |      +---------------+       | 
+    |                                        |      ^                       |
+    |                                        |      |                       |
+    |                                        |      |                       |   
+    |                                        |      |                       |   
+    |  +---------------+  +-------------+    |      |                       v   
+    +->| leafnode      |  | leafnode    |<---|      |       +------------+------------+  
+       +===============+  +=============+           |       | Block0     | Block1     |  
+       | OID           |  | OID         |           |       +============+============+  
+       | Omaps         |  | Omaps       |           |       | Data       | Data       |  
+       | Clones        |  | Clones      |           |       +------------+------------+  
+       | Data Extent   |  | Data Extent |-----------|     
+       +---------------+  +-------------+           
 
 
 WAL
@@ -321,45 +323,47 @@ is fixed and the size of each partition also should be configured before running
 Cache
 -----
 There are mainly two cache data structures; onode cache and block cache.
-Since PoseidonStore does not have the on-disk onode strucutre, there needs to be in-memory onode structure 
-for fast tracking of the objects.
-
 It looks like below.
 
+1.Onode cache:
+map <OID, OnodeRef>;
 Onode {
-  metadata
-  xattr map <key, value>
-  omap <key, value>
-  extent_map
+  extent tree block_maps;
+  clone tree clones;
+  omap lists omaps;
 }
+2. Block cache:
+Omap cache --> map <OID, <omap_key, value>>
+Data cache --> map <OID, <extent, value>>
 
-To fill the in-memory onode data structure, object meta, xattrs, and omap of the target object can be retrieved 
-using the respective PSD_OIDs.
-Block cache is used for caching a block contents and supporting transactions.
-For a transaction, all the updates to blocks (including object meta block, allocation bitmap block, data block) 
+To fill the onode data structure, object meta and omap of the target object can be retrieved 
+using the prefix tree.
+Block cache is used for caching a block contents. For a transaction, all the updates to blocks 
+(including object meta block, allocation bitmap block, data block) 
 are first performed in the in-memory block cache.
 After writing a transaction to the WAL, the dirty blocks are flushed to their respective locations in the 
 respective partitions.
 PoseidonStore can configure cache size for each type. Simple LRU cache eviction strategy can be used for both.
 
 
-Allocation Group (with cross-AG transaction)
+Sharded partitions (with cross-SP transaction)
 --------------------------------------------
-Entire disk space is divided into a number of equally sized chunks called Allocation Groups (AG).
-Each reactor thread in crimson-osd is responsible for a set of AGs (# of AGs / # of threads).
-Each AG has its own data structures to manage the disk partition.
-A collection is stored into an AG, not across AGs.
+Entire disk space is divided into a number of equally sized chunks called sharded partitions (SP).
+A collection is stored into an SP, not across SPs.
 The prefixes of the parent collection ID (original collection ID before collection splitting. That is, hobject.hash) 
-is hashed to map any collections to AGs allocated for the reactor thread.
+is hashed to map any collections to SPs.
 We can use BlueStore's approach for collection splitting, changing the number of significant bits for the collection prefixes.
 Because the prefixes of the parent collection ID do not change even after collection splitting, the mapping between 
-the collection and AG is maintained.
-The number of AGs may be configured to match the number of CPUs allocated for each disk so that each AG can hold 
-a number of objects large enough for cross-AG transaction not to occur.
-In case of need of cross-AG transaction, we could simply use the per-AG lock (acquire the source and target locks before 
-processing the cross-AG transaction).
-For the load unbalanced situation, we adjust the mapping between collection and AG and the mapping between reactor 
-thread and collection. 
+the collection and SP is maintained.
+The number of SPs may be configured to match the number of CPUs allocated for each disk so that each SP can hold 
+a number of objects large enough for cross-SP transaction not to occur.
+
+In case of need of cross-SP transaction, we could use the global WAL (acquire the source SP and target SP locks before 
+processing the cross-SP transaction). If SPs have an entry in the global WAL, it should apply it as soon as possible, then
+remove it from the gobal WAL.
+
+For the load unbalanced situation, we adjust the mapping between extent tree and data blocks in other SPs (This allocation
+probably requires cross-SP transaction). 
 
 
 Discussion
