@@ -39,7 +39,7 @@ The update-in-place strategy has been used widely for conventional file systems 
     - Flash unfriendly (more GC activity for SSDs)
     
 
-Motivation
+Motivation and Key Ideas
 ----------
 
 In modern distributed storage systems, a server node can be equipped with multiple 
@@ -56,6 +56,73 @@ Towards a object store highly optimized for CPU consumption, three design choice
 
 * **PoseidonStore uses hybrid update strategies for different data size, similar to BlueStore.** As we discussed, both in-place and out-of-place update strategies have their pros and cons. Since CPU is only bottlenecked under small I/O workloads, we chose update-in-place for small I/Os to miminize CPU consumption while choosing update-out-of-place for large I/O to avoid double write. Double write for small data may be better than host-GC overhead in terms of CPU consumption in the long run. Although it leaves GC entirely up to SSDs,
 high-end NVMe SSD has enuough powers to handle more works. Also, SSD lifespan is not a practical concern these days (there is enough program-earse cycle limit [1]). On the other hand, for large I/O workloads, the host can afford process host-GC. Also, the host can garbage collect invalid objects more effectively when their size is large.
+
+Data layout basics
+----------
+Disk space is divided into large segments (100's of MB). One or more cores/shards will access to a single NVMe SSD. Each shard will have a set of sharded partitions (SP). SP is a logical partition that can dynamically grown and shrunk. SP can get bigger by allocating segments and expanding address space, and can be smaller by returning segments. This design allows entire disk space to be efficiently utilized even where disk space load imbalance exists. All block numbers are SP relative. For the example below, assuming the segment size is 16KB and the block size is 4KB, the block number 5 is the second block in Segment 7.
+
+.. ditaa::
+       
+       [Global Meta] | [SP 0 Meta] | [SP 1 Meta] | ... | [SP N Meta] | [Data]
+
+       +---------------+-----------------------------+------------------------------------+
+       |   Superblock  |        SP Metablock         |      SP Free Space Block           |
+       | (Global Meta) |        (Per-SP Meta)        |          (Per-SP Meta)             |
+       |               |                             |                                    |
+       |               | +-------------------------+ |        # of free blocks            |
+       |    # of SPs   | |   SP free space info    | |Free space B+tree root node block[2]| <- by count, by offset
+       | # of free seg.| |   SP free space block   | |        # of allocated seg.         |
+       | Segment bitmap| +-------------------------+ |      segment map[# of seg.]        |
+       |               | |   SP onode B+tree info  | |      +--------------------+        |
+       |               | |  B+tree root node block | |      |     Segment 0      |        |
+       |               | +-------------------------+ |      |     Segment 7      |        |
+       |               |                             |      |     Segment 3      |        |
+       |               |                             |      +--------------------+        |
+       +---------------+-----------------------------+------------------------------------+                    
+       
+       +-----------------------------------+
+       | Free space B+tree root node block |
+       |          (Per-SP Meta)            |
+       |                                   |
+       |           # of records            |
+       |    left_sibling / right_sibling   |
+       | +--------------------------------+| 
+       | | keys[# of records]             ||
+       | | +-----------------------------+||
+       | | |   startblock / blockcount   |||
+       | | |           ...               |||
+       | | +-----------------------------+||
+       | +--------------------------------||
+       | +--------------------------------+| 
+       | | ptrs[# of records]             ||
+       | | +-----------------------------+||
+       | | |       SP block number       |||
+       | | |           ...               |||
+       | | +-----------------------------+||
+       | +--------------------------------+|
+       +-----------------------------------+
+
+       +-----------------------------------+  +----------------------------------+
+       |    onode B+tree root node block   |  |           onode block            | 
+       |          (Per-SP Meta)            |  |             (Data)               |
+       |                                   |  |                                  |
+       |           # of records            |  | +------------------------------+ |
+       |    left_sibling / right_sibling   |  | |          Metadata            | |
+       | +--------------------------------+|  | +------------------------------+ |
+       | | keys[# of records]             ||  | |          inline data         | |
+       | | +-----------------------------+||  | +------------------------------+ |
+       | | |    start onode ID           |||  | |            xattrs            | |
+       | | |           ...               |||  | +------------------------------+ |
+       | | +-----------------------------+||  | |  omap B+tree root node block | | <--- by key string in lexicographical order
+       | +--------------------------------||  | +------------------------------| | 
+       | +--------------------------------+|  | |Extent B+tree root node block | | <--- by offset
+       | | ptrs[# of records]             ||  | +------------------------------+ |
+       | | +-----------------------------+||  +----------------------------------+
+       | | |       SP block number       |||
+       | | |           ...               |||
+       | | +-----------------------------+||
+       | +--------------------------------+|
+       +-----------------------------------+
 
 
 Observation
@@ -209,7 +276,7 @@ Detailed Design
   to lookup the prefix tree efficiently.
 
   - Sharded partition
-  A few bits at the begining of OID determine a shareded partition where the object is located.
+  A few bits at the begining of OID determine a sharded partition where the object is located.
    +--------------------------+--------------------------+--------------------------+
    | sharded partition 1 (00) | sharded partition 2 (01) | sharded partition 3 (10) |
    +--------------------------+--------------------------+--------------------------+ 
